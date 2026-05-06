@@ -1,6 +1,26 @@
 // Digital twin domain types
 export type MaterialType = "COAL" | "IRON_ORE" | "LIMESTONE" | "OVERBURDEN";
 
+// Real Caterpillar haul truck models used in the mixed-fleet selector
+export interface TruckModel {
+  id: string;          // e.g. "CAT_777G"
+  label: string;       // e.g. "Cat 777G"
+  payloadT: number;    // tonnes
+  size: "S" | "M" | "L"; // maps to dump footprint scaling
+}
+
+export const TRUCK_MODELS: TruckModel[] = [
+  { id: "CAT_777G",  label: "Cat 777G",  payloadT: 100, size: "S" },
+  { id: "CAT_785",   label: "Cat 785",   payloadT: 139, size: "S" },
+  { id: "CAT_789D",  label: "Cat 789D",  payloadT: 181, size: "M" },
+  { id: "CAT_793F",  label: "Cat 793F",  payloadT: 227, size: "M" },
+  { id: "CAT_797F",  label: "Cat 797F",  payloadT: 363, size: "L" },
+  { id: "CAT_794AC", label: "Cat 794 AC", payloadT: 290, size: "L" },
+];
+
+// Fleet composition: how many of each model
+export type FleetConfig = Record<string, number>; // modelId → count
+
 export interface GridCell {
   x: number;
   y: number;

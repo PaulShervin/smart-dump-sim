@@ -1,6 +1,7 @@
 // HUD overlay: metrics panel + truck roster + live charts + heatmap toggle.
-import { useEffect, useRef } from "react";
-import type { Metrics, Truck, DumpEvent } from "@/sim/types";
+import { useEffect, useRef, useState } from "react";
+import type { Metrics, Truck, DumpEvent, FleetConfig } from "@/sim/types";
+import { TRUCK_MODELS } from "@/sim/types";
 import type { Zone } from "@/sim/voronoi";
 import { REASSIGN_THRESHOLD } from "@/sim/voronoi";
 import { DemoAvatar } from "./DemoAvatar";
@@ -22,8 +23,10 @@ interface Props {
   onCameraViewChange: (view: "ADMIN" | "TOP" | "SIDE" | "VEHICLE" | "FLEET") => void;
   selectedMaterial: string;
   onSelectedMaterialChange: (m: string) => void;
-  packingStrategy: "LEGACY" | "WINDROW";
-  onPackingStrategyChange: (s: "LEGACY" | "WINDROW") => void;
+  packingStrategy: "LEGACY" | "MIXED_FLEET";
+  onPackingStrategyChange: (s: "LEGACY" | "MIXED_FLEET") => void;
+  fleetConfig: FleetConfig;
+  onFleetConfigChange: (fc: FleetConfig) => void;
   isNight: boolean;
   onToggleNight: () => void;
   gridRef?: React.MutableRefObject<any>;
@@ -38,7 +41,9 @@ interface Props {
   };
 }
 
-export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpeedChange, metrics, trucks, events, showHeatmap, onToggleHeatmap, showEmptyGrid, onToggleEmptyGrid, cameraView, onCameraViewChange, selectedMaterial, onSelectedMaterialChange, isNight, onToggleNight, gridRef, isDemoMode, onToggleDemoMode }: Props) {
+export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpeedChange, metrics, trucks, events, showHeatmap, onToggleHeatmap, showEmptyGrid, onToggleEmptyGrid, cameraView, onCameraViewChange, selectedMaterial, onSelectedMaterialChange, packingStrategy, onPackingStrategyChange, isNight, onToggleNight, gridRef, isDemoMode, onToggleDemoMode, measurement, fleetConfig, onFleetConfigChange }: Props) {
+  const [showFleetPanel, setShowFleetPanel] = useState(false);
+  const totalTrucks = Object.values(fleetConfig).reduce((s, n) => s + n, 0);
   return (
     <div className="pointer-events-none absolute inset-0 z-10 flex flex-col">
       {/* Top bar */}
@@ -133,14 +138,86 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
               DEMO: {isDemoMode ? "1-TRUCK (4 DUMPS)" : "OFF"}
             </button>
           )}
-          <button
-            onClick={() => onPackingStrategyChange(packingStrategy === "LEGACY" ? "WINDROW" : "LEGACY")}
-            className={`px-3 py-1.5 border tracking-widest transition font-bold ${
-              packingStrategy === "WINDROW" ? "bg-green-600 text-white border-green-500" : "bg-red-900/50 text-red-400 border-red-500/50"
-            }`}
-          >
-            STRATEGY: {packingStrategy} {packingStrategy === "LEGACY" ? "(8m)" : "(3m)"}
-          </button>
+          <div className="relative">
+            <button
+              onClick={() => {
+                const nextStrategy = packingStrategy === "LEGACY" ? "MIXED_FLEET" : "LEGACY";
+                onPackingStrategyChange(nextStrategy);
+              }}
+              className={`px-3 py-1.5 border tracking-widest transition font-bold ${
+                packingStrategy === "MIXED_FLEET" ? "bg-emerald-600 text-white border-emerald-500" : "bg-slate-800 text-slate-400 border-slate-700"
+              }`}
+            >
+              STRATEGY: {packingStrategy === "MIXED_FLEET" ? "MIXED-FLEET" : "LEGACY"} {packingStrategy === "MIXED_FLEET" ? "(ANCHOR-BACKFILL)" : "(HEX-GRID)"}
+            </button>
+          </div>
+          <div className="relative">
+            <button
+              onClick={() => setShowFleetPanel(!showFleetPanel)}
+              className={`px-3 py-1.5 border tracking-widest transition font-bold flex items-center gap-1.5 ${
+                showFleetPanel ? "bg-primary text-primary-foreground border-primary" : "border-primary/50 text-primary hover:bg-primary/10"
+              }`}
+            >
+              FLEET CONFIG ({totalTrucks}) ▾
+            </button>
+            {showFleetPanel && (
+              <div className="absolute right-0 top-full mt-1 w-80 hud-panel border border-primary/30 bg-[#0a0a0f]/98 backdrop-blur-xl p-4 z-50 shadow-[0_8px_40px_rgba(0,0,0,0.6)]">
+                <div className="text-[10px] tracking-[0.3em] text-primary mb-4 font-bold flex items-center justify-between">
+                  <span>AUTONOMOUS FLEET MODELS</span>
+                  <span className="text-muted-foreground tracking-wider font-normal">{totalTrucks} TRUCKS</span>
+                </div>
+                <div className="flex flex-col gap-2">
+                  {TRUCK_MODELS.map((model) => {
+                    const count = fleetConfig[model.id] || 0;
+                    return (
+                      <div
+                        key={model.id}
+                        className={`flex items-center justify-between px-3 py-2.5 border transition-all ${
+                          count > 0
+                            ? "border-primary/40 bg-primary/5"
+                            : "border-border/50 bg-transparent opacity-60"
+                        }`}
+                      >
+                        <div className="flex flex-col">
+                          <span className="text-xs font-bold tracking-wider text-foreground">{model.label}</span>
+                          <span className="text-[9px] text-muted-foreground tracking-widest">{model.payloadT}t payload · {model.size}</span>
+                        </div>
+                        <div className="flex items-center gap-0">
+                          <button
+                            onClick={() => {
+                              if (count <= 0) return;
+                              const next = { ...fleetConfig, [model.id]: count - 1 };
+                              onFleetConfigChange(next);
+                            }}
+                            className="w-7 h-7 flex items-center justify-center border border-border text-muted-foreground hover:text-foreground hover:border-primary/50 transition text-sm font-bold"
+                          >
+                            −
+                          </button>
+                          <div className="w-8 h-7 flex items-center justify-center border-y border-border text-sm font-bold tabular-nums text-primary">
+                            {count}
+                          </div>
+                          <button
+                            onClick={() => {
+                              if (totalTrucks >= 15) return;
+                              const next = { ...fleetConfig, [model.id]: count + 1 };
+                              onFleetConfigChange(next);
+                            }}
+                            className="w-7 h-7 flex items-center justify-center border border-border text-muted-foreground hover:text-foreground hover:border-primary/50 transition text-sm font-bold"
+                          >
+                            +
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-3 pt-3 border-t border-border/50 flex items-center justify-between">
+                  <span className="text-[9px] text-muted-foreground tracking-widest">TOTAL CONFIGURED TRUCKS</span>
+                  <span className="text-sm font-bold text-primary tabular-nums">{totalTrucks}</span>
+                </div>
+              </div>
+            )}
+          </div>
           <button
             onClick={() => onCameraViewChange(cameraView === "FLEET" ? "ADMIN" : "FLEET")}
             className={`px-3 py-1.5 border tracking-widest transition font-bold ${

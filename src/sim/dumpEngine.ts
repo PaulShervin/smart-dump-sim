@@ -1,7 +1,7 @@
 // Dump decision engine: scores candidate cells, picks from top decile,
 // validates with BFS + slope, reserves footprint with time window.
 import type { GridCell } from "./types";
-import { GRID_SIZE, SLOPE_LIMIT, MAX_PILE_HEIGHT, gridToWorld, recomputeSlopesLocal } from "./grid";
+import { GRID_SIZE, SLOPE_LIMIT, MAX_PILE_HEIGHT, gridToWorld, worldToGrid, recomputeSlopesLocal } from "./grid";
 import { bfsReachable } from "./pathfinding";
 
 const W1 = 1.6;   // low-height preference
@@ -11,12 +11,13 @@ const W6 = 5.0;   // furthest from entry (back-to-front packing)
 
 export function pickDumpCell(
   grid: GridCell[][],
-  truckGrid: [number, number],
+  truck: any, // Pass the whole truck object for size awareness
   now: number,
   entryPoint: [number, number] = [2, 2],
   isDemoMode: boolean = false,
-  strategy: "LEGACY" | "WINDROW" = "LEGACY"
+  strategy: "LEGACY" | "MIXED_FLEET" = "LEGACY"
 ): [number, number] | null {
+  const truckGrid = worldToGrid(truck.position[0], truck.position[2]);
   // 1. Hexagonal/Staggered Grid: Enforcing exactly 3.03m gap between dumps
   // Dump diameter is ~4m. 4m + 3.03m gap = 7.03m center-to-center.
   // 7.03m / 2m per cell = 3.515 cells step.
@@ -96,53 +97,120 @@ export function pickDumpCell(
       }
     }
   } else {
-    // WINDROW STRATEGY
-    // Row spacing: 8m (4 cells) to allow a wide, safe driving lane
-    // Along-row spacing: 3m (1.5 cells) for dense overlapping peaks
-    const rowSpacing = 4.0; // cells
-    const cellSpacing = 1.5; // cells
+    // =====================================================================
+    // MIXED-FLEET STAGGERED-ROW STRATEGY
+    // Implements: Anchor → Gap → Backfill → Row Complete → Next Row
+    // =====================================================================
+    //
+    // ALGORITHM:
+    //   1. Generate all rows (parallel to X-axis, furthest Y first)
+    //   2. For each row, generate SLOTS at fixed spacing
+    //   3. Label even-index slots as ANCHOR, odd-index as BACKFILL
+    //   4. FIRST PASS:  Only allow ANCHOR slots → trucks dump with gaps
+    //                   Pattern: [DUMP] [GAP] [DUMP] [GAP] [DUMP]
+    //   5. SECOND PASS: Once ALL anchors filled → allow BACKFILL slots
+    //                   Pattern: [DUMP] [DUMP] [DUMP] [DUMP] [DUMP]
+    //   6. Row is COMPLETE when every slot (anchor+backfill) is filled
+    //   7. Only then move to the next closer row
+    //
+    // Truck size determines dump spacing:
+    //   D = r1 + r2 + safety_gap - overlap + margin
+    //   S: 2.0+2.0+1.0-0.5+0.5 = 5.0 cells (10m anchor-to-anchor)
+    //   M: 2.5+2.5+1.0-0.5+0.5 = 6.0 cells (12m anchor-to-anchor)  
+    //   L: 3.0+3.0+1.0-0.5+0.5 = 7.0 cells (14m anchor-to-anchor)
+    // We use a moderate default of 3 cells between slot centers 
+    // (6m real), so anchors are 6 cells (12m) apart with backfill 
+    // slots in the gaps.
 
-    for (let yF = maxY; yF >= minY; yF -= rowSpacing) {
-      for (let xF = maxX; xF >= minX; xF -= cellSpacing) {
+    const SLOT_SPACING = 3;   // cells between slot centers (anchor-to-anchor = 6 cells)
+    const ROW_SPACING  = 4;   // cells between rows (8m driving lane)
+
+    // --- Generate rows from furthest (maxY) to nearest (minY) ---
+    const rows: number[] = [];
+    for (let yF = maxY; yF >= minY; yF -= ROW_SPACING) {
+      rows.push(Math.round(yF));
+    }
+
+    // --- Iterate rows in order (furthest first) ---
+    for (const rowY of rows) {
+      if (rowY < 0 || rowY >= GRID_SIZE) continue;
+
+      // Row stagger: offset alternate rows by half a slot for interlocking
+      const rowIdx = rows.indexOf(rowY);
+      const staggerOffset = (rowIdx % 2 === 0) ? 0 : Math.floor(SLOT_SPACING / 2);
+
+      // --- Generate all slot positions for this row ---
+      const allSlots: { x: number; y: number; isAnchor: boolean }[] = [];
+      let slotIndex = 0;
+      for (let xF = minX + staggerOffset; xF <= maxX; xF += SLOT_SPACING) {
         const x = Math.round(xF);
-        const y = Math.round(yF);
-
-        if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) continue;
-
-        const c = grid[y][x];
-
-        if (c.reserved && c.reservedUntil > now) continue;
-        
-        // In windrow mode, we are explicitly allowing overlapping piles!
-        // But we shouldn't dump exactly on top of a very tall existing peak.
-        if (c.height > 1.5) continue;
-        
-        if (c.slope > SLOPE_LIMIT) continue;
-        if (!reachable.has(y * GRID_SIZE + x)) continue;
-
-        const distFromEntry = Math.hypot(x - entryPoint[0], y - entryPoint[1]);
-        let score = distFromEntry * 5.0;
-
-        // WINDROW ATTRACTION: If there's an existing pile adjacent to this cell ALONG THE SAME ROW,
-        // dramatically increase the score so the truck "continues the line".
-        let windrowBonus = 0;
-        for (let dx = -3; dx <= 3; dx++) {
-           if (dx === 0) continue;
-           const checkX = x + dx;
-           if (checkX >= 0 && checkX < GRID_SIZE) {
-             if (grid[y][checkX].height > 0.5) {
-                // Closer to an existing pile = much higher bonus
-                windrowBonus += (10 - Math.abs(dx)) * 30; 
-             }
-           }
-        }
-        score += windrowBonus;
-
-        const distFromTruck = Math.hypot(x - truckGrid[0], y - truckGrid[1]);
-        score -= distFromTruck * 0.8;
-
-        candidates.push({ x, y, score });
+        if (x < 0 || x >= GRID_SIZE) continue;
+        allSlots.push({
+          x,
+          y: rowY,
+          isAnchor: slotIndex % 2 === 0, // even = ANCHOR, odd = BACKFILL
+        });
+        slotIndex++;
       }
+
+      if (allSlots.length === 0) continue;
+
+      // --- Classify slot states ---
+      const anchorSlots  = allSlots.filter(s => s.isAnchor);
+      const backfillSlots = allSlots.filter(s => !s.isAnchor);
+
+      // A slot is "filled" if terrain height > 0.5m at its position
+      const isFilled = (s: { x: number; y: number }) => {
+        return grid[s.y][s.x].height > 0.5;
+      };
+
+      const allAnchorsFilled = anchorSlots.every(isFilled);
+      const allSlotsFilled   = allSlots.every(isFilled);
+
+      // If this entire row is complete, skip to next row
+      if (allSlotsFilled) continue;
+
+      // --- Determine which slots are available in this row ---
+      // FIRST PASS:  Only anchor slots until at least 4 anchors are placed
+      // SECOND PASS: After 4+ anchors done → start filling gaps too
+      const filledAnchorCount = anchorSlots.filter(isFilled).length;
+      let availableSlots: { x: number; y: number; isAnchor: boolean }[];
+
+      if (filledAnchorCount < 4) {
+        // FIRST PASS: Only empty anchor positions (leave gaps)
+        availableSlots = anchorSlots.filter(s => !isFilled(s));
+      } else {
+        // SECOND PASS: 4+ anchors placed → fill gaps + remaining anchors
+        availableSlots = allSlots.filter(s => !isFilled(s));
+      }
+
+      // --- Filter for reachability, slope, and reservation ---
+      const validSlots = availableSlots.filter(s => {
+        const c = grid[s.y][s.x];
+        if (c.reserved && c.reservedUntil > now) return false;
+        if (c.slope > SLOPE_LIMIT) return false;
+        if (!reachable.has(s.y * GRID_SIZE + s.x)) return false;
+        return true;
+      });
+
+      if (validSlots.length === 0) {
+        // No valid slots in this row right now (maybe reserved by other trucks)
+        // Still try this row — don't skip to next row
+        continue;
+      }
+
+      // --- Pick the best slot: nearest to truck for fast assignment ---
+      let bestSlot = validSlots[0];
+      let bestDist = Infinity;
+      for (const s of validSlots) {
+        const d = Math.hypot(s.x - truckGrid[0], s.y - truckGrid[1]);
+        if (d < bestDist) {
+          bestDist = d;
+          bestSlot = s;
+        }
+      }
+
+      return [bestSlot.x, bestSlot.y];
     }
   }
 
@@ -196,11 +264,15 @@ const peakFactor = 1.3;
 export function applyDump(
   grid: GridCell[][],
   cell: [number, number],
-  volume: number,
+  truck: any, // Pass truck to determine volume/size
   material: string = "OVERBURDEN"
 ): [number, number][] {
   const [cx, cy] = cell;
   grid[cy][cx].hasDump = true;
+
+  // Scale volume by truck size: S=0.8, M=1.2, L=1.8
+  const sizeFactors = { S: 0.8, M: 1.2, L: 1.8 };
+  const volume = sizeFactors[truck.size as keyof typeof sizeFactors] || 1.2;
 
   // Random jittering algorithm slightly mutates rx, ry, peak by up to 20%
   const jitterRx = 1 + (Math.random() * 0.4 - 0.2);

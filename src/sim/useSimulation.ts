@@ -1,7 +1,8 @@
 // Central simulation hook. Owns grid, trucks, metrics. Drives the FSM at
 // fixed-step (~30Hz) independent of render frame rate.
 import { useEffect, useRef, useState } from "react";
-import type { GridCell, Truck, Metrics, DumpEvent } from "@/sim/types";
+import type { GridCell, Truck, Metrics, DumpEvent, FleetConfig } from "@/sim/types";
+import { TRUCK_MODELS } from "@/sim/types";
 import {
   GRID_SIZE, CELL_M, MAX_PILE_HEIGHT, makeGrid, gridToWorld, worldToGrid, recomputeSlopesLocal,
 } from "@/sim/grid";
@@ -10,45 +11,57 @@ import {
   pickDumpCell, reserveFootprint, clearExpiredReservations, applyDump,
 } from "@/sim/dumpEngine";
 
-const TRUCK_COLORS = ["#fbb414", "#fcd34d", "#fbbf24", "#f59e0b", "#d97706"]; // CAT Industrial Yellow
+const TRUCK_COLORS = ["#fbb414", "#fcd34d", "#fbbf24", "#f59e0b", "#d97706", "#eab308", "#ca8a04", "#a16207"]; // CAT Industrial Yellow
 const MATERIALS: ("COAL" | "IRON_ORE" | "LIMESTONE" | "OVERBURDEN")[] = ["COAL", "IRON_ORE", "LIMESTONE", "OVERBURDEN", "IRON_ORE"];
 const ENTRY_POINTS: [number, number][] = [
   [2, 2], // Single entry/exit point for all trucks
 ];
 
-function makeTrucks(n: number): Truck[] {
+const DEFAULT_FLEET: FleetConfig = {
+  CAT_777G: 1,
+  CAT_785: 1,
+  CAT_789D: 1,
+  CAT_793F: 1,
+  CAT_797F: 1,
+  CAT_794AC: 0,
+};
+
+function makeTrucksFromFleet(fleet: FleetConfig, materialOverride: string): Truck[] {
   const trucks: Truck[] = [];
-  for (let i = 0; i < n; i++) {
-    const entry = ENTRY_POINTS[i % ENTRY_POINTS.length];
-    const [wx, wz] = gridToWorld(entry[0], entry[1]);
-    const sizes: ("S" | "M" | "L")[] = ["M", "L", "M", "S", "L"];
-    trucks.push({
-      id: `T-${(i + 1).toString().padStart(2, "0")}`,
-      state: "IDLE",
-      position: [wx, 0, wz],
-      heading: 0,
-      speed: 0,
-      load: 1,
-      size: sizes[i % sizes.length],
-      color: TRUCK_COLORS[i % TRUCK_COLORS.length],
-      material: MATERIALS[i % MATERIALS.length],
-      path: [],
-      pathIndex: 0,
-      bedTilt: 0,
-      wheelSpin: 0,
-      dumpProgress: 0,
-      cycleStart: performance.now(),
-      lastCycleMs: 0,
-      totalDumps: 0,
-    });
+  let idx = 0;
+  for (const model of TRUCK_MODELS) {
+    const count = fleet[model.id] || 0;
+    for (let k = 0; k < count; k++) {
+      const entry = ENTRY_POINTS[0];
+      const [wx, wz] = gridToWorld(entry[0], entry[1]);
+      const mat = materialOverride === "MIXED" ? MATERIALS[idx % MATERIALS.length] : (materialOverride as any);
+      trucks.push({
+        id: `T-${(idx + 1).toString().padStart(2, "0")}`,
+        state: "IDLE",
+        position: [wx, 0, wz],
+        heading: 0,
+        speed: 0,
+        load: 1,
+        size: model.size,
+        color: TRUCK_COLORS[idx % TRUCK_COLORS.length],
+        material: mat,
+        path: [],
+        pathIndex: 0,
+        bedTilt: 0,
+        wheelSpin: 0,
+        dumpProgress: 0,
+        cycleStart: performance.now(),
+        lastCycleMs: 0,
+        totalDumps: 0,
+      });
+      idx++;
+    }
   }
-  
-  // Apply default material if it is not MIXED (e.g. IRON_ORE)
-  trucks.forEach((t, idx) => {
-    t.material = "IRON_ORE";
-  });
-  
   return trucks;
+}
+
+function totalFromFleet(fleet: FleetConfig): number {
+  return Object.values(fleet).reduce((s, n) => s + n, 0);
 }
 
 export interface SimState {
@@ -61,12 +74,14 @@ export interface SimState {
 
 const TRUCK_SPEED_MPS = 6; // metres/sec
 
-export type PackingStrategy = "LEGACY" | "WINDROW";
+export type PackingStrategy = "LEGACY" | "MIXED_FLEET";
 
 export function useSimulation(initialTrucks = 5) {
   const gridRef = useRef<GridCell[][]>(makeGrid());
-  const trucksRef = useRef<Truck[]>(makeTrucks(initialTrucks));
-  const [targetTruckCount, setTargetTruckCount] = useState(initialTrucks);
+  const [fleetConfig, setFleetConfigState] = useState<FleetConfig>(DEFAULT_FLEET);
+  const fleetConfigRef = useRef<FleetConfig>(DEFAULT_FLEET);
+  const trucksRef = useRef<Truck[]>(makeTrucksFromFleet(DEFAULT_FLEET, "IRON_ORE"));
+  const [targetTruckCount, setTargetTruckCount] = useState(totalFromFleet(DEFAULT_FLEET));
   const [isDemoMode, setIsDemoModeState] = useState(false);
   const isDemoModeRef = useRef(false);
   const eventsRef = useRef<DumpEvent[]>([]);
@@ -94,6 +109,21 @@ export function useSimulation(initialTrucks = 5) {
     setPackingStrategyState(s);
   };
 
+  const setFleetConfig = (fc: FleetConfig) => {
+    fleetConfigRef.current = fc;
+    setFleetConfigState(fc);
+    const newTotal = totalFromFleet(fc);
+    setTargetTruckCount(newTotal);
+    // Rebuild trucks from fleet config
+    trucksRef.current = makeTrucksFromFleet(fc, selectedMaterialRef.current);
+    // Reset grid for fair comparison
+    gridRef.current = makeGrid();
+    eventsRef.current = [];
+    tickRef.current = 0;
+    cycleSamplesRef.current = [];
+    dumpTimestampsRef.current = [];
+  };
+
   const setSimSpeed = (speed: number) => {
     simSpeedRef.current = speed;
     setSimSpeedState(speed);
@@ -110,10 +140,12 @@ export function useSimulation(initialTrucks = 5) {
     
     if (val) {
       setTargetTruckCount(1);
-      trucksRef.current = makeTrucks(1);
+      trucksRef.current = makeTrucksFromFleet({ CAT_789D: 1 }, selectedMaterialRef.current);
     } else {
-      setTargetTruckCount(5);
-      trucksRef.current = makeTrucks(5);
+      const fc = fleetConfigRef.current;
+      const n = totalFromFleet(fc);
+      setTargetTruckCount(n);
+      trucksRef.current = makeTrucksFromFleet(fc, selectedMaterialRef.current);
     }
   };
 
@@ -130,24 +162,12 @@ export function useSimulation(initialTrucks = 5) {
   const runningRef = useRef(true);
 
   useEffect(() => {
+    // Fleet is now rebuilt entirely via setFleetConfig,
+    // but the slider still works as a quick "add more of default model" shortcut.
     const currentLen = trucksRef.current.length;
-    if (targetTruckCount > currentLen) {
-      const newTrucks = makeTrucks(targetTruckCount - currentLen);
-      // Fix IDs and properties based on existing count
-      newTrucks.forEach((t, i) => {
-        const idx = currentLen + i;
-        const entry = ENTRY_POINTS[idx % ENTRY_POINTS.length];
-        const [wx, wz] = gridToWorld(entry[0], entry[1]);
-        const sizes: ("S" | "M" | "L")[] = ["M", "L", "M", "S", "L"];
-        t.id = `T-${(idx + 1).toString().padStart(2, "0")}`;
-        t.position = [wx, 0, wz];
-        t.size = sizes[idx % sizes.length];
-        t.color = TRUCK_COLORS[idx % TRUCK_COLORS.length];
-        t.material = selectedMaterialRef.current === "MIXED" ? MATERIALS[idx % MATERIALS.length] : (selectedMaterialRef.current as any);
-      });
-      trucksRef.current.push(...newTrucks);
-    } else if (targetTruckCount < currentLen) {
-      trucksRef.current.splice(targetTruckCount);
+    if (targetTruckCount !== currentLen) {
+      // Rebuild from fleet config
+      trucksRef.current = makeTrucksFromFleet(fleetConfigRef.current, selectedMaterialRef.current);
     }
   }, [targetTruckCount]);
 
@@ -220,7 +240,7 @@ export function useSimulation(initialTrucks = 5) {
       
       // Plan: pick a dump cell
       const entry = ENTRY_POINTS[0];
-      const target = pickDumpCell(grid, [tgx, tgy], now, entry, isDemoModeRef.current, packingStrategyRef.current);
+      const target = pickDumpCell(grid, truck, now, entry, isDemoModeRef.current, packingStrategyRef.current);
       if (!target) return;
 
       // We pathfind directly to the target, which pickDumpCell already guaranteed is reachable.
@@ -298,7 +318,7 @@ export function useSimulation(initialTrucks = 5) {
       truck.load = Math.max(0, 1 - truck.dumpProgress);
       if (truck.dumpProgress >= 1 && truck.target) {
         // Apply material
-        applyDump(grid, truck.target, 1.2, truck.material);
+        applyDump(grid, truck.target, truck, truck.material);
         recomputeSlopesLocal(grid, truck.target[0], truck.target[1], 5);
         truck.totalDumps++;
         eventIdRef.current++;
@@ -339,6 +359,8 @@ export function useSimulation(initialTrucks = 5) {
     setPackingStrategy,
     isDemoMode,
     setIsDemoMode,
+    fleetConfig,
+    setFleetConfig,
   };
 }
 
