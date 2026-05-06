@@ -28,7 +28,9 @@ export function TruckMesh({ truck, isNight, onClick }: Props) {
   });
 
   const s = SIZE_SCALE[truck.size];
-  const bodyColor = truck.color;
+  // Backfill trucks get a distinct cyan/teal color to stand out from anchor (yellow) trucks
+  const isBackfill = truck.role === "BACKFILL";
+  const bodyColor = isBackfill ? "#06b6d4" : truck.color;
   const dark = "#1a1410";
   const yellow = "#fcd34d";
 
@@ -209,6 +211,24 @@ export function TruckMesh({ truck, isNight, onClick }: Props) {
           emissiveIntensity={1.5}
         />
       </mesh>
+
+      {/* Role indicator ring — glowing cyan torus for BACKFILL trucks */}
+      {isBackfill && (
+        <group position={[0, 3.0 * s, 0]}>
+          <mesh rotation={[Math.PI / 2, 0, 0]}>
+            <torusGeometry args={[0.4, 0.06, 8, 24]} />
+            <meshStandardMaterial
+              color="#06b6d4"
+              emissive="#22d3ee"
+              emissiveIntensity={3.0}
+              transparent
+              opacity={0.9}
+            />
+          </mesh>
+          {/* Vertical beacon light for backfill visibility */}
+          <pointLight intensity={8} distance={15} color="#22d3ee" />
+        </group>
+      )}
     </group>
   );
 }

@@ -32,6 +32,7 @@ export interface GridCell {
   reservedUntil: number; // ms timestamp
   material?: MaterialType;
   hasDump?: boolean;
+  isBackfill?: boolean; // true if this dump was placed as a backfill (gap-fill) operation
 }
 
 export type TruckState = "MOVING" | "ARRIVED" | "DUMPING" | "RETURNING" | "IDLE";
@@ -49,6 +50,7 @@ export interface Truck {
   path: [number, number][]; // grid coords
   pathIndex: number;
   target?: [number, number]; // grid coord
+  role?: "ANCHOR" | "BACKFILL"; // current dump role in MIXED_FLEET strategy
   bedTilt: number; // 0..1
   wheelSpin: number;
   dumpProgress: number; // 0..1 during DUMPING

@@ -9,6 +9,11 @@ const W2 = 0.8;   // proximity to truck
 const W4 = 2.5;   // slope penalty
 const W6 = 5.0;   // furthest from entry (back-to-front packing)
 
+export interface DumpCellResult {
+  cell: [number, number];
+  role: "ANCHOR" | "BACKFILL";
+}
+
 export function pickDumpCell(
   grid: GridCell[][],
   truck: any, // Pass the whole truck object for size awareness
@@ -16,7 +21,7 @@ export function pickDumpCell(
   entryPoint: [number, number] = [2, 2],
   isDemoMode: boolean = false,
   strategy: "LEGACY" | "MIXED_FLEET" = "LEGACY"
-): [number, number] | null {
+): DumpCellResult | null {
   const truckGrid = worldToGrid(truck.position[0], truck.position[2]);
   // 1. Hexagonal/Staggered Grid: Enforcing exactly 3.03m gap between dumps
   // Dump diameter is ~4m. 4m + 3.03m gap = 7.03m center-to-center.
@@ -98,18 +103,19 @@ export function pickDumpCell(
     }
   } else {
     // =====================================================================
-    // MIXED-FLEET STAGGERED-ROW STRATEGY
-    // Implements: Anchor → Gap → Backfill → Row Complete → Next Row
+    // MIXED-FLEET STAGGERED-ROW STRATEGY (Size-Based Role Assignment)
+    // Implements: Big→Anchor, Small→Backfill, Row Complete → Next Row
     // =====================================================================
     //
     // ALGORITHM:
     //   1. Generate all rows (parallel to X-axis, furthest Y first)
     //   2. For each row, generate SLOTS at fixed spacing
     //   3. Label even-index slots as ANCHOR, odd-index as BACKFILL
-    //   4. FIRST PASS:  Only allow ANCHOR slots → trucks dump with gaps
-    //                   Pattern: [DUMP] [GAP] [DUMP] [GAP] [DUMP]
-    //   5. SECOND PASS: Once ALL anchors filled → allow BACKFILL slots
-    //                   Pattern: [DUMP] [DUMP] [DUMP] [DUMP] [DUMP]
+    //   4. BIG TRUCKS (L/M) → assigned to ANCHOR slots first
+    //      Pattern: [BIG] [GAP] [BIG] [GAP] [BIG]
+    //   5. SMALL TRUCKS (S)  → assigned to BACKFILL slots only after
+    //      ≥4 anchors are placed by big trucks in that row
+    //      Pattern: [BIG] [SML] [BIG] [SML] [BIG]
     //   6. Row is COMPLETE when every slot (anchor+backfill) is filled
     //   7. Only then move to the next closer row
     //
@@ -170,18 +176,39 @@ export function pickDumpCell(
       // If this entire row is complete, skip to next row
       if (allSlotsFilled) continue;
 
-      // --- Determine which slots are available in this row ---
-      // FIRST PASS:  Only anchor slots until at least 4 anchors are placed
-      // SECOND PASS: After 4+ anchors done → start filling gaps too
+      // --- Size-based role assignment ---
+      // Big trucks (L/M) → ANCHOR role: lay structural foundation piles
+      // Small trucks (S)  → BACKFILL role: fill gaps between anchors
+      const truckSize = truck.size as "S" | "M" | "L";
+      const isBigTruck = truckSize === "L" || truckSize === "M";
       const filledAnchorCount = anchorSlots.filter(isFilled).length;
       let availableSlots: { x: number; y: number; isAnchor: boolean }[];
 
-      if (filledAnchorCount < 4) {
-        // FIRST PASS: Only empty anchor positions (leave gaps)
-        availableSlots = anchorSlots.filter(s => !isFilled(s));
+      if (isBigTruck) {
+        // --- BIG TRUCK (L/M): Anchor-first assignment ---
+        const emptyAnchors = anchorSlots.filter(s => !isFilled(s));
+        if (emptyAnchors.length > 0) {
+          // Primary role: fill anchor slots to build the structural ridge
+          availableSlots = emptyAnchors;
+        } else {
+          // All anchors done in this row → big truck can assist with backfill
+          availableSlots = allSlots.filter(s => !isFilled(s));
+        }
       } else {
-        // SECOND PASS: 4+ anchors placed → fill gaps + remaining anchors
-        availableSlots = allSlots.filter(s => !isFilled(s));
+        // --- SMALL TRUCK (S): Backfill-only assignment ---
+        if (filledAnchorCount < 4) {
+          // Not enough anchors placed yet → small truck WAITS (skip this row)
+          // The big trucks need to lay the foundation first
+          continue;
+        }
+        // Enough anchors are in place → small truck fills the gaps
+        const emptyBackfills = backfillSlots.filter(s => !isFilled(s));
+        if (emptyBackfills.length > 0) {
+          availableSlots = emptyBackfills;
+        } else {
+          // All backfill done → help with any remaining slots in this row
+          availableSlots = allSlots.filter(s => !isFilled(s));
+        }
       }
 
       // --- Filter for reachability, slope, and reservation ---
@@ -210,7 +237,7 @@ export function pickDumpCell(
         }
       }
 
-      return [bestSlot.x, bestSlot.y];
+      return { cell: [bestSlot.x, bestSlot.y], role: bestSlot.isAnchor ? "ANCHOR" as const : "BACKFILL" as const };
     }
   }
 
@@ -218,7 +245,7 @@ export function pickDumpCell(
 
   // Sort candidates from best to worst
   candidates.sort((a, b) => b.score - a.score);
-  return [candidates[0].x, candidates[0].y];
+  return { cell: [candidates[0].x, candidates[0].y], role: "ANCHOR" as const };
 }
 
 export function reserveFootprint(
@@ -269,6 +296,8 @@ export function applyDump(
 ): [number, number][] {
   const [cx, cy] = cell;
   grid[cy][cx].hasDump = true;
+  const isBackfill = truck.role === "BACKFILL";
+  grid[cy][cx].isBackfill = isBackfill;
 
   // Scale volume by truck size: S=0.8, M=1.2, L=1.8
   const sizeFactors = { S: 0.8, M: 1.2, L: 1.8 };
@@ -314,6 +343,8 @@ export function applyDump(
         // assign material to the cell if it's the core of the dump
         if (!grid[y][x].material || gaussianHeight > grid[y][x].height - 1.5) {
           grid[y][x].material = material as any;
+          // Mark backfill cells so terrain renders them in a distinct color
+          if (isBackfill) grid[y][x].isBackfill = true;
         }
       }
       affected.push([x, y]);

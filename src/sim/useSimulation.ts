@@ -240,8 +240,10 @@ export function useSimulation(initialTrucks = 5) {
       
       // Plan: pick a dump cell
       const entry = ENTRY_POINTS[0];
-      const target = pickDumpCell(grid, truck, now, entry, isDemoModeRef.current, packingStrategyRef.current);
-      if (!target) return;
+      const result = pickDumpCell(grid, truck, now, entry, isDemoModeRef.current, packingStrategyRef.current);
+      if (!result) return;
+      const target = result.cell;
+      truck.role = result.role;
 
       // We pathfind directly to the target, which pickDumpCell already guaranteed is reachable.
       let path = astar(grid, [tgx, tgy], target);
@@ -273,6 +275,7 @@ export function useSimulation(initialTrucks = 5) {
           truck.lastCycleMs = cycleMs;
           cycleSamplesRef.current.push(cycleMs);
           truck.state = "IDLE";
+          truck.role = undefined;
           truck.load = 1;
         }
         return;

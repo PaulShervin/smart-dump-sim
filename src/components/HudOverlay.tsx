@@ -284,6 +284,9 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
         <Legend color="#f97316" label="DUMPING" />
         <Legend color="#a78bfa" label="RETURNING" />
         <span className="text-muted-foreground">·</span>
+        <Legend color="#fbb414" label="ANCHOR TRUCK" />
+        <Legend color="#06b6d4" label="BACKFILL TRUCK" />
+        <span className="text-muted-foreground">·</span>
         <span>SLOPE LIMIT: 0.6</span>
         <span>·</span>
         <span>GRID: 48×48 @ 2m</span>
@@ -457,9 +460,14 @@ function TruckRoster({ trucks, followTruck, onFollow }: { trucks: Truck[]; follo
               }`}
             >
               <div className="flex items-center gap-2">
-                <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: t.color, boxShadow: `0 0 6px ${t.color}` }} />
+                <span className="h-1.5 w-1.5 rounded-full" style={{ backgroundColor: t.role === "BACKFILL" ? "#06b6d4" : t.color, boxShadow: `0 0 6px ${t.role === "BACKFILL" ? "#06b6d4" : t.color}` }} />
                 <span className="font-bold tracking-widest">{t.id}</span>
                 <span className="text-muted-foreground">{t.size}</span>
+                {t.role && (
+                  <span className={`text-[8px] px-1 py-0.5 tracking-wider border font-bold ${t.role === "BACKFILL" ? "text-cyan-400 border-cyan-500/40 bg-cyan-500/10" : "text-yellow-400 border-yellow-500/40 bg-yellow-500/10"}`}>
+                    {t.role}
+                  </span>
+                )}
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-muted-foreground tabular-nums">{t.totalDumps}</span>

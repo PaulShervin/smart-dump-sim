@@ -24,6 +24,13 @@ const MAT_COLORS = {
   OVERBURDEN: { low: new THREE.Color("#7a5230"), high: new THREE.Color("#3d2a1a"), crest: new THREE.Color("#d9b27a") },
 };
 
+// Distinct cyan/teal palette for backfill (gap-fill) dumps
+const BACKFILL_COLORS = {
+  low: new THREE.Color("#0e7490"),   // dark teal base
+  high: new THREE.Color("#06b6d4"),  // mid cyan 
+  crest: new THREE.Color("#67e8f9"), // bright cyan crest
+};
+
 const C_EMPTY = new THREE.Color("#1e1e1e"); // Dark base surface
 
 const H_LOW = new THREE.Color("#1f7a3a");
@@ -91,7 +98,10 @@ export function Terrain({ gridRef, showHeatmap, showEmptyGrid, onClick }: Props)
           if (currentH <= 0.01) {
             c.copy(C_EMPTY);
           } else {
-            const matColors = MAT_COLORS[cell.material || "OVERBURDEN"];
+            // Use backfill palette for gap-fill dumps, material palette for anchors
+            const matColors = cell.isBackfill
+              ? BACKFILL_COLORS
+              : MAT_COLORS[cell.material || "OVERBURDEN"];
             const t = Math.min(1, currentH / 5);
             if (t < 0.5) c.lerpColors(matColors.low, matColors.high, t / 0.5);
             else c.lerpColors(matColors.high, matColors.crest, (t - 0.5) / 0.5);
