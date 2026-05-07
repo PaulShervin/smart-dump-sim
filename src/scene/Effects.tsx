@@ -69,7 +69,7 @@ export function PathLines({ trucks }: { trucks: Truck[] }) {
   return (
     <group>
       {trucks.map((t) => {
-        if (!t.path.length || t.state === "IDLE" || t.state === "DUMPING") return null;
+        if (!t.path.length || t.state === "WAITING_AT_ENTRY" || t.state === "DUMPING") return null;
         const remaining = t.path.slice(Math.max(0, t.pathIndex - 1));
         if (remaining.length < 2) return null;
         const points = remaining.map(([gx, gy]) => {
@@ -205,7 +205,7 @@ export function V2XBeams({ trucks, tick }: { trucks: Truck[]; tick: number }) {
         <meshStandardMaterial color="#f59e0b" emissive="#f59e0b" emissiveIntensity={0.6 + 0.4 * Math.sin(tick * 0.2)} />
       </mesh>
       {trucks.map((t) => {
-        if (t.state === "IDLE") return null;
+        if (t.state === "WAITING_AT_ENTRY") return null;
         const points = [
           new THREE.Vector3(t.position[0], t.position[1] + 2.5, t.position[2]),
           new THREE.Vector3(0, 12, 0),

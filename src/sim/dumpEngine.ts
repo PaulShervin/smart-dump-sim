@@ -2,7 +2,7 @@
 // validates with BFS + slope, reserves footprint with time window.
 import type { GridCell } from "./types";
 import { GRID_SIZE, SLOPE_LIMIT, MAX_PILE_HEIGHT, gridToWorld, worldToGrid, recomputeSlopesLocal } from "./grid";
-import { bfsReachable } from "./pathfinding";
+import { bfsReachable, checkCorridorPreservation } from "./pathfinding";
 
 // FIX 1+2: Effective truck dump radii in grid cells — r = cbrt(volume) × μ where μ=1.0
 // S: cbrt(0.8)=0.928  M: cbrt(1.2)=1.063  L: cbrt(1.8)=1.216
@@ -55,7 +55,8 @@ export function pickDumpCell(
   entryPoint: [number, number] = [2, 2],
   isDemoMode: boolean = false,
   strategy: "LEGACY" | "MIXED_FLEET" | "HOMOGENEOUS" = "LEGACY",
-  isInsideYard?: (gx: number, gy: number) => boolean
+  isInsideYard?: (gx: number, gy: number) => boolean,
+  fleetSmallestRadius: number = 0.928
 ): DumpCellResult | null {
   const truckGrid = worldToGrid(truck.position[0], truck.position[2]);
   // FIX 8: Removed dead function-scope stepCells/rowStepCells — redefined inside LEGACY branch below
@@ -242,38 +243,49 @@ export function pickDumpCell(
            if (canTake) {
               let targetX = currentX;
               if (nearestPile) {
-                 // FIX T5: Pile Age Spacing Multiplier
+                 // FIX T5 & PP5: Pile Age Spacing Multiplier & Footprint Gap
                  const spacingMultiplier = nearestPile.age > 0 
                     ? (nearestPile.age > 20000 ? 0.52 : (nearestPile.age > 8000 ? 0.60 : 0.75)) 
                     : 1.0;
                  
-                 const r_i = TRUCK_RADIUS[isAnchorSlot ? "L" : "S"];
-                 const r_j = TRUCK_RADIUS[nearestPile.size as "S" | "M" | "L"];
-                 const d_ij = r_i + r_j + 1.0 - 0.5 + 0.5;
-                 
-                 // FIX 4: ANCHOR phase = 2 * d_ij, BACKFILL phase = 1 * d_ij
-                 const phaseMultiplier = isAnchorSlot ? 2 : 1;
-                 const d_effective = d_ij * spacingMultiplier * phaseMultiplier;
-                 
                  const sign = nearestPile.x < currentX ? 1 : -1;
-                 targetX = nearestPile.x + sign * d_effective;
+
+                 if (isAnchorSlot) {
+                    const r_anchor = TRUCK_RADIUS[isBigTruck ? truckSize : "L"];
+                    const r_nearest = TRUCK_RADIUS[nearestPile.size as "S" | "M" | "L"];
+                    const gap = 2 * fleetSmallestRadius;
+                    // anchor_radius + gap + anchor_radius
+                    const d_effective = (r_anchor + gap + r_nearest) * spacingMultiplier;
+                    targetX = nearestPile.x + sign * d_effective;
+                 } else {
+                    // Backfill: Center of gap. 
+                    // From nearest anchor: r_anchor + r_small
+                    const r_nearest = TRUCK_RADIUS[nearestPile.size as "S" | "M" | "L"];
+                    const d_effective = (r_nearest + fleetSmallestRadius) * spacingMultiplier;
+                    targetX = nearestPile.x + sign * d_effective;
+                 }
               }
               
               const bx = Math.round(targetX);
-              if (bx >= 0 && bx < GRID_SIZE && (!isInsideYard || isInsideYard(bx, rowY))) {
-                 const k = rowY * GRID_SIZE + bx;
-                 const c = grid[rowY][bx];
-                 // If not reserved and reachable, it's a valid candidate!
-                 if (!c.reserved || c.reservedUntil <= now) {
-                    if (c.slope <= SLOPE_LIMIT && reachable.has(k)) {
-                       candidates.push({ 
-                          cell: [bx, rowY], 
-                          role: isAnchorSlot ? "ANCHOR" : "BACKFILL", 
-                          distToTruck: Math.hypot(bx - truckGrid[0], rowY - truckGrid[1]) 
-                       });
-                    }
-                 }
-              }
+               if (bx >= 0 && bx < GRID_SIZE && (!isInsideYard || isInsideYard(bx, rowY))) {
+                  const k = rowY * GRID_SIZE + bx;
+                  const c = grid[rowY][bx];
+                  // If not reserved and reachable, it's a valid candidate!
+                  if (!c.reserved || c.reservedUntil <= now) {
+                     if (c.slope <= SLOPE_LIMIT && reachable.has(k)) {
+                        // FIX P3: Pre-dump Reachability Check (Corridor Preservation)
+                        if (checkCorridorPreservation(grid, entryPoint, [bx, rowY])) {
+                           candidates.push({ 
+                              cell: [bx, rowY], 
+                              role: isAnchorSlot ? "ANCHOR" : "BACKFILL", 
+                              distToTruck: Math.hypot(bx - truckGrid[0], rowY - truckGrid[1]) 
+                           });
+                        } else {
+                           console.log(`Slot rejected — would isolate zone at ${bx}, ${rowY}`);
+                        }
+                     }
+                  }
+               }
            }
         }
         

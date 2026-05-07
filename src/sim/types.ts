@@ -37,11 +37,19 @@ export interface GridCell {
   isConfirmedPile?: boolean;
 }
 
-export type TruckState = "MOVING" | "ARRIVED" | "DUMPING" | "RETURNING" | "IDLE";
+export type TruckState = 
+  | "WAITING_AT_ENTRY" 
+  | "MOVING_TO_TARGET" 
+  | "PRE_DUMP_SCAN" 
+  | "REVERSING" 
+  | "DUMPING" 
+  | "POST_DUMP_SCAN" 
+  | "RETURNING";
 
 export interface Truck {
   id: string;
   state: TruckState;
+  stateTime: number; // ms spent in current state
   position: [number, number, number];
   heading: number; // radians
   speed: number;
@@ -49,10 +57,19 @@ export interface Truck {
   size: "S" | "M" | "L";
   color: string;
   material: MaterialType;
-  path: [number, number][]; // grid coords
+  path: [number, number][]; // grid coords or smoothed coords
   pathIndex: number;
+  lastPathCheckAt?: number;
+  needsReplan?: boolean;
+  replanAttempts?: number;
+  maxReplanAttempts?: number;
+  lastPositionChange?: number;
+  lastRecordedPosition?: [number, number, number];
+  stuckThresholdMs?: number;
+  waitUntil?: number;
   target?: [number, number]; // grid coord
-  role?: "ANCHOR" | "BACKFILL"; // current dump role in MIXED_FLEET strategy
+  approachPoint?: [number, number]; // where the truck stops before reversing
+  role?: "ANCHOR" | "BACKFILL"; 
   bedTilt: number; // 0..1
   wheelSpin: number;
   dumpProgress: number; // 0..1 during DUMPING

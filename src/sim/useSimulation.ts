@@ -4,9 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import type { GridCell, Truck, Metrics, DumpEvent, FleetConfig } from "@/sim/types";
 import { TRUCK_MODELS } from "@/sim/types";
 import {
-  GRID_SIZE, CELL_M, MAX_PILE_HEIGHT, makeGrid, gridToWorld, worldToGrid, recomputeSlopesLocal,
+  GRID_SIZE, CELL_M, MAX_PILE_HEIGHT, makeGrid, gridToWorld, worldToGrid, recomputeSlopesLocal, SLOPE_LIMIT
 } from "@/sim/grid";
-import { astar } from "@/sim/pathfinding";
+import { astar, smoothPath } from "@/sim/pathfinding";
 import {
   pickDumpCell, reserveFootprint, clearExpiredReservations, applyDump, processDirtySlopes, filledCellCount, resetFilledCellCount
 } from "@/sim/dumpEngine";
@@ -45,7 +45,8 @@ function makeTrucksFromFleet(fleet: FleetConfig, materialOverride: string, entry
       const color = sizeColors[model.size] || "#fbb414";
       trucks.push({
         id: `T-${(idx + 1).toString().padStart(2, "0")}`,
-        state: "IDLE",
+        state: "WAITING_AT_ENTRY",
+        stateTime: 0,
         position: [wx, 0, wz],
         heading: 0,
         speed: 0,
@@ -296,7 +297,7 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
     const res = {
       totalDumps: trucksRef.current.reduce((s, t) => s + t.totalDumps, 0),
       avgHeight, utilization, packingDensity, throughput, avgCycleMs,
-      activeTrucks: trucksRef.current.filter(t => t.state !== "IDLE").length,
+      activeTrucks: trucksRef.current.filter(t => t.state !== "WAITING_AT_ENTRY").length,
       peakToPeak,
     };
     prevMetricsRef.current = res;
@@ -314,64 +315,17 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
 
   function stepTruck(truck: Truck, dt: number, now: number) {
     const grid = gridRef.current;
-    const [tgx, tgy] = worldToGrid(truck.position[0], truck.position[2]);
+    truck.stateTime += dt * 1000;
 
-    if (truck.state === "IDLE") {
-      // In demo mode, stop exactly after 4 dumps so the user can easily observe the packing.
-      if (isDemoModeRef.current && truck.totalDumps >= 4) {
-        return;
-      }
-      
-      // Plan: pick a dump cell
-      const yardCfg = dumpYardRef?.current;
-      const entry: [number, number] = yardCfg?.isFinalized ? yardCfg.entryGrid : ENTRY_POINTS[0];
-      const isInsideYard = yardCfg?.isFinalized ? yardCfg.isInsideYard : undefined;
-      const result = pickDumpCell(grid, truck, now, entry, isDemoModeRef.current, packingStrategyRef.current, isInsideYard);
-      if (!result) return;
-      const target = result.cell;
-      truck.role = result.role;
-
-      // We pathfind directly to the target, which pickDumpCell already guaranteed is reachable.
-      let path = astar(grid, [tgx, tgy], target);
-      if (!path || path.length < 2) return;
-
-      // Stop the truck a few steps before the exact target center 
-      // to avoid it driving completely up a forming peak
-      if (path.length > 3) {
-        path = path.slice(0, path.length - 2);
-      }
-
-      reserveFootprint(grid, target, truck.heading, truck.size, now, 12000);
-      truck.target = target;
-      truck.path = path;
-      truck.pathIndex = 1;
-      truck.state = "MOVING";
-      truck.cycleStart = now;
-      return;
-    }
-
-    if (truck.state === "MOVING" || truck.state === "RETURNING") {
-      // Follow path
-      if (!truck.path.length || truck.pathIndex >= truck.path.length) {
-        if (truck.state === "MOVING") {
-          truck.state = "ARRIVED";
-        } else {
-          // Returned to entry: cycle complete
-          const cycleMs = now - truck.cycleStart;
-          truck.lastCycleMs = cycleMs;
-          cycleSamplesRef.current.push(cycleMs);
-          truck.state = "IDLE";
-          truck.role = undefined;
-          truck.load = 1;
-        }
-        return;
-      }
+    const moveAlongPath = (speedCellsPerSec: number, reverse = false) => {
+      if (!truck.path.length || truck.pathIndex >= truck.path.length) return true;
       const [gx, gy] = truck.path[truck.pathIndex];
       const [wx, wz] = gridToWorld(gx, gy);
       const dx = wx - truck.position[0];
       const dz = wz - truck.position[2];
       const d = Math.hypot(dx, dz);
-      const move = TRUCK_SPEED_MPS * dt;
+      const move = speedCellsPerSec * CELL_M * dt;
+      
       if (d <= move) {
         truck.position = [wx, terrainHeightAt(grid, gx, gy), wz];
         truck.pathIndex++;
@@ -380,64 +334,294 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
         const nz = truck.position[2] + (dz / d) * move;
         const [ngx, ngy] = worldToGrid(nx, nz);
         truck.position = [nx, terrainHeightAt(grid, ngx, ngy), nz];
-        truck.heading = Math.atan2(dx, dz);
+        truck.heading = reverse ? Math.atan2(-dx, -dz) : Math.atan2(dx, dz);
       }
-      truck.speed = TRUCK_SPEED_MPS;
-      truck.wheelSpin += dt * 6;
-      return;
-    }
+      truck.speed = speedCellsPerSec * CELL_M;
+      truck.wheelSpin += dt * (reverse ? -6 : 6);
+      return false;
+    };
 
-    if (truck.state === "ARRIVED") {
-      truck.speed = 0;
-      truck.state = "DUMPING";
-      truck.dumpProgress = 0;
-      // Spin around to dump backwards!
-      if (truck.target) {
-        const [twx, twz] = gridToWorld(truck.target[0], truck.target[1]);
-        const dx = truck.position[0] - twx;
-        const dz = truck.position[2] - twz;
-        truck.heading = Math.atan2(dx, dz);
-      }
-      return;
-    }
-
-    if (truck.state === "DUMPING") {
-      truck.dumpProgress += dt / 2.5; // ~2.5s dump
-      truck.bedTilt = Math.min(1, truck.dumpProgress * 1.4);
-      truck.load = Math.max(0, 1 - truck.dumpProgress);
-      if (truck.dumpProgress >= 1 && truck.target) {
-        // Apply material
-        applyDump(grid, truck.target, truck, truck.material);
-        // FIX T2: No synchronous recomputeSlopesLocal here; dirty system handles it.
-        truck.totalDumps++;
-        eventIdRef.current++;
-        eventsRef.current.push({
-          id: eventIdRef.current,
-          truckId: truck.id,
-          cell: truck.target,
-          volume: 1.2,
-          t: now,
-        });
-        dumpTimestampsRef.current.push(now);
-
-        // Plan return
-        const yardCfg2 = dumpYardRef?.current;
-        const entry: [number, number] = yardCfg2?.isFinalized ? yardCfg2.entryGrid : ENTRY_POINTS[0];
-        const [tgx2, tgy2] = worldToGrid(truck.position[0], truck.position[2]);
-        const path = astar(grid, [tgx2, tgy2], entry, { ignoreReserved: true });
-        truck.path = path && path.length > 1 ? path : [[tgx2, tgy2], entry];
-        truck.pathIndex = 1;
-        truck.state = "RETURNING";
-        truck.bedTilt = 0;
+    switch (truck.state as string) {
+      case "WAITING_AT_ENTRY": {
+        if (isDemoModeRef.current && truck.totalDumps >= 4) return;
+        
+        const yardCfg = dumpYardRef?.current;
+        const entry: [number, number] = yardCfg?.isFinalized ? yardCfg.entryGrid : ENTRY_POINTS[0];
+        const isInsideYard = yardCfg?.isFinalized ? yardCfg.isInsideYard : undefined;
+        
+        const [wx, wz] = gridToWorld(entry[0], entry[1]);
+        truck.position = [wx, terrainHeightAt(grid, entry[0], entry[1]), wz];
+        truck.speed = 0;
+        truck.load = 1;
         truck.dumpProgress = 0;
+        truck.bedTilt = 0;
         
-        // FIX T5: Confirm pile age tracking
-        const cell = grid[truck.target[1]][truck.target[0]];
-        cell.isConfirmedPile = true;
-        cell.dumpCompletedAt = now;
+        const radii: Record<"S" | "M" | "L", number> = { S: 0.928, M: 1.063, L: 1.216 };
+        let smallestR = radii["L"];
+        for (const t of trucksRef.current) {
+           if (radii[t.size] < smallestR) smallestR = radii[t.size];
+        }
+
+        const result = pickDumpCell(grid, truck, now, entry, isDemoModeRef.current, packingStrategyRef.current, isInsideYard, smallestR);
+        if (!result) return;
         
-        truck.target = undefined;
+        truck.target = result.cell;
+        truck.role = result.role;
+
+        let path = astar(grid, entry, truck.target, { sizeClass: truck.size as any });
+        if (!path || path.length < 2) return;
+        
+        const turnRadii: Record<"S" | "M" | "L", number> = { S: 5.5, M: 6.5, L: 7.5 };
+        path = smoothPath(path, turnRadii[truck.size as "S"|"M"|"L"]);
+        
+        if (path.length > 5) {
+          truck.approachPoint = path[path.length - 5];
+          truck.path = path.slice(0, path.length - 4);
+        } else {
+          truck.approachPoint = path[path.length - 1];
+          truck.path = path;
+        }
+        
+        reserveFootprint(grid, truck.target, truck.heading, truck.size, now, 12000);
+        
+        truck.pathIndex = 1;
+        truck.state = "MOVING_TO_TARGET";
+        truck.stateTime = 0;
+        truck.cycleStart = now;
+        truck.lastPathCheckAt = now;
+        truck.needsReplan = false;
+        truck.replanAttempts = 0;
+        break;
       }
+
+      case "MOVING_TO_TARGET":
+      case "RETURNING": {
+        if (truck.waitUntil && now < truck.waitUntil) {
+          truck.speed = 0;
+          break;
+        }
+
+        const isReturning = truck.state === "RETURNING";
+        const yardCfg = dumpYardRef?.current;
+        const entry: [number, number] = yardCfg?.isFinalized ? yardCfg.entryGrid : ENTRY_POINTS[0];
+        const goal = isReturning ? entry : (truck.target || entry);
+
+        const tryReplan = (goalCoords: [number, number]) => {
+          truck.replanAttempts = (truck.replanAttempts || 0) + 1;
+          const [tx, ty] = worldToGrid(truck.position[0], truck.position[2]);
+          let newPath: [number, number][] | null = null;
+          
+          if (truck.replanAttempts === 1) {
+             newPath = astar(grid, [tx, ty], goalCoords, { heightThreshold: 1.5, sizeClass: truck.size as any, ignoreReserved: isReturning });
+          } else if (truck.replanAttempts === 2) {
+             newPath = astar(grid, [tx, ty], goalCoords, { ignoreAllHeight: true, sizeClass: truck.size as any, ignoreReserved: isReturning });
+          } else {
+             if (isReturning) {
+               newPath = [[tx, ty], goalCoords];
+             } else {
+               truck.state = "WAITING_AT_ENTRY";
+               truck.stateTime = 0;
+               truck.target = undefined;
+               truck.replanAttempts = 0;
+               truck.needsReplan = false;
+               return false;
+             }
+          }
+          
+          if (newPath && newPath.length > 1) {
+             const turnRadii: Record<"S" | "M" | "L", number> = { S: 5.5, M: 6.5, L: 7.5 };
+             newPath = smoothPath(newPath, turnRadii[truck.size as "S"|"M"|"L"]);
+             
+             if (!isReturning && newPath.length > 5) {
+                truck.approachPoint = newPath[newPath.length - 5];
+                truck.path = newPath.slice(0, newPath.length - 4);
+             } else {
+                if (!isReturning) truck.approachPoint = newPath[newPath.length - 1];
+                truck.path = newPath;
+             }
+             truck.pathIndex = 1;
+             truck.needsReplan = false;
+             truck.replanAttempts = 0;
+             return true;
+          }
+          return false;
+        };
+
+        if (truck.needsReplan) {
+           tryReplan(goal);
+           break;
+        }
+
+        if (now - (truck.lastPathCheckAt || 0) > 500) {
+           truck.lastPathCheckAt = now;
+           const lookAhead = truck.path.slice(truck.pathIndex, truck.pathIndex + 5);
+           let blocked = false;
+           for(const [lx, ly] of lookAhead) {
+              const cx = Math.round(lx), cy = Math.round(ly);
+              if (cx >= 0 && cx < GRID_SIZE && cy >= 0 && cy < GRID_SIZE) {
+                 const cell = grid[cy][cx];
+                 if (cell.height > 0.5) {
+                    blocked = true;
+                    break;
+                 }
+              }
+           }
+           if (blocked) {
+              truck.needsReplan = true;
+              truck.speed = 0;
+              break;
+           }
+        }
+
+        if (truck.lastRecordedPosition) {
+           const [lx, ly, lz] = truck.lastRecordedPosition;
+           const distMoved = Math.hypot(truck.position[0] - lx, truck.position[2] - lz);
+           if (distMoved > 0.1) {
+              truck.lastPositionChange = now;
+              truck.lastRecordedPosition = [...truck.position];
+           }
+        } else {
+           truck.lastRecordedPosition = [...truck.position];
+           truck.lastPositionChange = now;
+        }
+
+        const stuckMs = now - (truck.lastPositionChange || now);
+        if (stuckMs > 8000) {
+           const isHighPriority = parseInt(truck.id.split('-')[1]) % 2 === 0;
+           if (isHighPriority) {
+              truck.waitUntil = now + 2000;
+           } else {
+              const [tx, ty] = worldToGrid(truck.position[0], truck.position[2]);
+              const dx = entry[0] - tx, dy = entry[1] - ty;
+              const len = Math.hypot(dx, dy) || 1;
+              const bx = Math.round(tx + (dx/len)*2);
+              const by = Math.round(ty + (dy/len)*2);
+              truck.path = [[tx, ty], [bx, by]];
+              truck.pathIndex = 1;
+              truck.needsReplan = true; 
+           }
+           truck.lastPositionChange = now;
+           break;
+        }
+
+        const speedMap: Record<"S" | "M" | "L", number> = { S: 1.5, M: 1.2, L: 1.0 };
+        const speed = speedMap[truck.size] || 1.2;
+        const reached = moveAlongPath(speed);
+        
+        if (reached) {
+          if (truck.needsReplan) {
+             tryReplan(goal);
+          } else if (isReturning) {
+             const cycleMs = now - truck.cycleStart;
+             truck.lastCycleMs = cycleMs;
+             cycleSamplesRef.current.push(cycleMs);
+             truck.state = "WAITING_AT_ENTRY";
+             truck.stateTime = 0;
+             truck.role = undefined;
+          } else {
+             truck.state = "PRE_DUMP_SCAN";
+             truck.stateTime = 0;
+             truck.speed = 0;
+          }
+        }
+        break;
+      }
+
+      case "PRE_DUMP_SCAN": {
+        if (truck.stateTime >= 1500) {
+          if (truck.target) {
+            const tc = grid[truck.target[1]][truck.target[0]];
+            if (tc.height < 0.5 && tc.slope <= SLOPE_LIMIT && !tc.occupied) {
+              truck.path = [truck.approachPoint || [0,0], truck.target];
+              truck.pathIndex = 1;
+              truck.state = "REVERSING";
+              truck.stateTime = 0;
+            } else {
+              truck.state = "WAITING_AT_ENTRY";
+              truck.stateTime = 0;
+            }
+          } else {
+             truck.state = "WAITING_AT_ENTRY";
+             truck.stateTime = 0;
+          }
+        }
+        break;
+      }
+
+      case "REVERSING": {
+        const reached = moveAlongPath(0.4, true);
+        if (reached) {
+          truck.state = "DUMPING";
+          truck.stateTime = 0;
+          truck.speed = 0;
+          
+          if (truck.target && truck.approachPoint) {
+            const [twx, twz] = gridToWorld(truck.target[0], truck.target[1]);
+            const [awx, awz] = gridToWorld(truck.approachPoint[0], truck.approachPoint[1]);
+            truck.heading = Math.atan2(awx - twx, awz - twz);
+          }
+        }
+        break;
+      }
+
+      case "DUMPING": {
+        truck.dumpProgress = Math.min(1, truck.stateTime / 2500);
+        truck.bedTilt = Math.min(1, truck.dumpProgress * 1.4);
+        truck.load = Math.max(0, 1 - truck.dumpProgress);
+        
+        if (truck.dumpProgress >= 1) {
+          if (truck.target) {
+            applyDump(grid, truck.target, truck, truck.material);
+            truck.totalDumps++;
+            eventIdRef.current++;
+            eventsRef.current.push({
+              id: eventIdRef.current, truckId: truck.id, cell: truck.target, volume: 1.2, t: now
+            });
+            dumpTimestampsRef.current.push(now);
+          }
+          truck.state = "POST_DUMP_SCAN";
+          truck.stateTime = 0;
+        }
+        break;
+      }
+
+      case "POST_DUMP_SCAN": {
+        if (truck.stateTime >= 1000) {
+          if (truck.target) {
+            const cell = grid[truck.target[1]][truck.target[0]];
+            cell.isConfirmedPile = true;
+            cell.dumpCompletedAt = now;
+            truck.target = undefined;
+          }
+          
+          const yardCfg = dumpYardRef?.current;
+          const entry: [number, number] = yardCfg?.isFinalized ? yardCfg.entryGrid : ENTRY_POINTS[0];
+          const [tgx, tgy] = worldToGrid(truck.position[0], truck.position[2]);
+          let path = astar(grid, [tgx, tgy], entry, { ignoreReserved: true, heightThreshold: 1.5, sizeClass: truck.size as any });
+          if (path && path.length > 1) {
+             const turnRadii: Record<"S" | "M" | "L", number> = { S: 5.5, M: 6.5, L: 7.5 };
+             path = smoothPath(path, turnRadii[truck.size as "S" | "M" | "L"]);
+             truck.path = path;
+          } else {
+             truck.path = [[tgx, tgy], entry];
+          }
+          truck.pathIndex = 1;
+          truck.state = "RETURNING";
+          truck.stateTime = 0;
+          truck.bedTilt = 0;
+          truck.dumpProgress = 0;
+          truck.needsReplan = false;
+          truck.replanAttempts = 0;
+        }
+        break;
+      }
+
+      case "IDLE":
+      case "MOVING":
+      case "ARRIVED":
+         truck.state = "WAITING_AT_ENTRY";
+         truck.stateTime = 0;
+         break;
     }
   }
 
@@ -478,8 +662,10 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
 }
 
 function terrainHeightAt(grid: GridCell[][], gx: number, gy: number) {
-  if (gx < 0 || gy < 0 || gx >= GRID_SIZE || gy >= GRID_SIZE) return 0;
-  return grid[gy][gx].height;
+  const ix = Math.round(gx);
+  const iy = Math.round(gy);
+  if (ix < 0 || iy < 0 || ix >= GRID_SIZE || iy >= GRID_SIZE) return 0;
+  return grid[iy][ix].height;
 }
 
 export { GRID_SIZE, CELL_M };
