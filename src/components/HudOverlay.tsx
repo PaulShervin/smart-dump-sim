@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Metrics, Truck, DumpEvent, FleetConfig } from "@/sim/types";
 import { TRUCK_MODELS } from "@/sim/types";
+import { Moon, Sun, Monitor, Map as MapIcon, Boxes, Activity, Timer } from "lucide-react";
 import type { Zone } from "@/sim/voronoi";
 import { REASSIGN_THRESHOLD } from "@/sim/voronoi";
 import { DemoAvatar } from "./DemoAvatar";
@@ -9,8 +10,6 @@ import type { MeasurementState } from "@/hooks/useMeasurementStore";
 import type { DumpYardState } from "@/hooks/useDumpYardStore";
 
 interface Props {
-  truckCount: number;
-  onTruckCountChange: (count: number) => void;
   simSpeed: number;
   onSimSpeedChange: (speed: number) => void;
   metrics: Metrics;
@@ -24,8 +23,7 @@ interface Props {
   onCameraViewChange: (view: "ADMIN" | "TOP" | "SIDE" | "VEHICLE" | "FLEET") => void;
   selectedMaterial: string;
   onSelectedMaterialChange: (m: string) => void;
-  packingStrategy: "LEGACY" | "MIXED_FLEET";
-  onPackingStrategyChange: (s: "LEGACY" | "MIXED_FLEET") => void;
+  packingStrategy: "LEGACY" | "MIXED_FLEET" | "HOMOGENEOUS";
   fleetConfig: FleetConfig;
   onFleetConfigChange: (fc: FleetConfig) => void;
   isNight: boolean;
@@ -55,14 +53,14 @@ interface Props {
   };
 }
 
-export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpeedChange, metrics, trucks, events, showHeatmap, onToggleHeatmap, showEmptyGrid, onToggleEmptyGrid, cameraView, onCameraViewChange, selectedMaterial, onSelectedMaterialChange, packingStrategy, onPackingStrategyChange, isNight, onToggleNight, gridRef, isDemoMode, onToggleDemoMode, measurement, fleetConfig, onFleetConfigChange, dumpYard, simControl }: Props) {
+export function HudOverlay({ simSpeed, onSimSpeedChange, metrics, trucks, events, showHeatmap, onToggleHeatmap, showEmptyGrid, onToggleEmptyGrid, cameraView, onCameraViewChange, selectedMaterial, onSelectedMaterialChange, packingStrategy, isNight, onToggleNight, gridRef, isDemoMode, onToggleDemoMode, measurement, fleetConfig, onFleetConfigChange, dumpYard, simControl }: Props) {
   const [showFleetPanel, setShowFleetPanel] = useState(false);
   const totalTrucks = Object.values(fleetConfig).reduce((s, n) => s + n, 0);
   return (
     <div className="pointer-events-none absolute inset-0 z-10 flex flex-col">
       {/* Top bar */}
-      <header className="pointer-events-auto flex items-center justify-between px-6 py-3 hud-panel border-b">
-        <div className="flex items-center gap-4">
+      <header className="pointer-events-auto flex items-center justify-between px-4 py-2 hud-panel border-b">
+        <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
             <div className="h-2.5 w-2.5 rounded-full bg-primary animate-pulse" style={{ boxShadow: "0 0 12px hsl(var(--primary))" }} />
             <h1 className="text-sm font-bold tracking-[0.3em] text-primary hud-glow">OREPACK</h1>
@@ -77,24 +75,24 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
               {!simControl.isRunning ? (
                 <button
                   onClick={simControl.startSim}
-                  className="px-5 py-2 border-2 border-emerald-500 text-emerald-400 tracking-[0.3em] transition font-black text-sm hover:bg-emerald-500/20 flex items-center gap-2"
-                  style={{ boxShadow: '0 0 20px rgba(16,185,129,0.25), inset 0 0 15px rgba(16,185,129,0.08)' }}
+                  className="px-3 py-1.5 border-2 border-emerald-500 text-emerald-400 tracking-[0.2em] transition font-black text-xs hover:bg-emerald-500/20 flex items-center gap-2"
+                  style={{ boxShadow: '0 0 15px rgba(16,185,129,0.2), inset 0 0 10px rgba(16,185,129,0.05)' }}
                 >
-                  <span className="text-lg">▶</span> START
+                  ▶ START
                 </button>
               ) : (
                 <button
                   onClick={simControl.pauseSim}
-                  className="px-5 py-2 border-2 border-amber-500 text-amber-400 tracking-[0.3em] transition font-black text-sm hover:bg-amber-500/20 flex items-center gap-2"
-                  style={{ boxShadow: '0 0 20px rgba(245,158,11,0.25), inset 0 0 15px rgba(245,158,11,0.08)' }}
+                  className="px-3 py-1.5 border-2 border-amber-500 text-amber-400 tracking-[0.2em] transition font-black text-xs hover:bg-amber-500/20 flex items-center gap-2"
+                  style={{ boxShadow: '0 0 15px rgba(245,158,11,0.2), inset 0 0 10px rgba(245,158,11,0.05)' }}
                 >
-                  <span className="text-lg">⏸</span> PAUSE
+                  ⏸ PAUSE
                 </button>
               )}
             </div>
           )}
         </div>
-        <div className="flex items-center gap-4 text-[10px]">
+        <div className="flex items-center gap-3 text-[10px]">
           <div className="flex flex-col gap-1 mr-4">
             <label className="text-muted-foreground tracking-widest flex justify-between">
               <span>SIM SPEED:</span>
@@ -106,21 +104,7 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
               max="10"
               value={simSpeed}
               onChange={(e) => onSimSpeedChange(parseInt(e.target.value))}
-              className="w-24 accent-primary cursor-pointer"
-            />
-          </div>
-          <div className="flex flex-col gap-1 mr-4">
-            <label className="text-muted-foreground tracking-widest flex justify-between">
-              <span>FLEET SIZE:</span>
-              <span className="text-primary">{truckCount}</span>
-            </label>
-            <input
-              type="range"
-              min="1"
-              max="15"
-              value={truckCount}
-              onChange={(e) => onTruckCountChange(parseInt(e.target.value))}
-              className="w-24 accent-primary cursor-pointer"
+              className="w-20 accent-primary cursor-pointer"
             />
           </div>
           <div className="flex flex-col gap-1 mr-4">
@@ -175,19 +159,8 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
               DEMO: {isDemoMode ? "1-TRUCK (4 DUMPS)" : "OFF"}
             </button>
           )}
-          <div className="relative">
-            <button
-              onClick={() => {
-                const nextStrategy = packingStrategy === "LEGACY" ? "MIXED_FLEET" : "LEGACY";
-                onPackingStrategyChange(nextStrategy);
-              }}
-              className={`px-3 py-1.5 border tracking-widest transition font-bold ${
-                packingStrategy === "MIXED_FLEET" ? "bg-emerald-600 text-white border-emerald-500" : "bg-slate-800 text-slate-400 border-slate-700"
-              }`}
-            >
-              STRATEGY: {packingStrategy === "MIXED_FLEET" ? "MIXED-FLEET" : "LEGACY"} {packingStrategy === "MIXED_FLEET" ? "(ANCHOR-BACKFILL)" : "(HEX-GRID)"}
-            </button>
-          </div>
+           {/* Strategy is now automated */}
+
           <div className="relative">
             <button
               onClick={() => setShowFleetPanel(!showFleetPanel)}
@@ -271,14 +244,7 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
           >
             HEATMAP {showHeatmap ? "ON" : "OFF"}
           </button>
-          <button
-            onClick={onToggleNight}
-            className={`px-3 py-1.5 border tracking-widest transition ${
-              isNight ? "bg-primary text-primary-foreground border-primary" : "border-border text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            TIME: {isNight ? "NIGHT" : "DAY"}
-          </button>
+          {/* Day/Night toggled moved to footer icon */}
           {measurement && (
             <button
               onClick={() => measurement.state.step === "idle" ? measurement.startSelection() : measurement.reset()}
@@ -362,7 +328,7 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
             {/* Left: Metrics + Charts */}
             <div className="pointer-events-auto flex flex-col gap-3 w-72 overflow-y-auto">
               <MetricsPanel metrics={metrics} />
-              <ChartCard title="PACKING DENSITY" value={metrics.packingDensity} max={1} unit="%" series="density" tick={metrics.totalDumps} />
+              <DensityAnalysis peakToPeak={metrics.peakToPeak} packingDensity={metrics.packingDensity} />
               <ChartCard title="THROUGHPUT (60s)" value={metrics.throughput} max={20} unit="dumps" series="throughput" tick={metrics.totalDumps} />
               <ChartCard title="AVG CYCLE TIME" value={metrics.avgCycleMs / 1000} max={60} unit="s" series="cycle" tick={metrics.totalDumps} />
             </div>
@@ -382,12 +348,30 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
         <Legend color="#f97316" label="DUMPING" />
         <Legend color="#a78bfa" label="RETURNING" />
         <span className="text-muted-foreground">·</span>
-        <Legend color="#fbb414" label="ANCHOR TRUCK" />
-        <Legend color="#06b6d4" label="BACKFILL TRUCK" />
+        <Legend color="#06b6d4" label="SMALL (S)" />
+        <Legend color="#d946ef" label="MEDIUM (M)" />
+        <Legend color="#84cc16" label="LARGE (L)" />
         <span className="text-muted-foreground">·</span>
         <span>SLOPE LIMIT: 0.6</span>
         <span>·</span>
+        <div className="flex items-center gap-2">
+           <span className="text-[9px] uppercase">STRATEGY:</span>
+           <span className="text-primary font-bold">{packingStrategy.replace('_', ' ')}</span>
+        </div>
+        <span>·</span>
         <span>GRID: 48×48 @ 2m</span>
+        
+        <button
+          onClick={onToggleNight}
+          className={`ml-4 p-2 rounded-full transition-all border ${
+            isNight 
+              ? "bg-slate-900 text-blue-400 border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.2)]" 
+              : "bg-amber-100 text-amber-600 border-amber-500/30 shadow-[0_0_15px_rgba(245,158,11,0.2)]"
+          }`}
+          title={isNight ? "Switch to Day" : "Switch to Night"}
+        >
+          {isNight ? <Moon size={16} fill="currentColor" /> : <Sun size={16} fill="currentColor" />}
+        </button>
       </footer>
       </>
       )}
@@ -527,16 +511,49 @@ function MetricsPanel({ metrics }: { metrics: Metrics }) {
         <Metric label="UTIL" value={`${(metrics.utilization * 100).toFixed(1)}%`} />
         <Metric label="AVG H" value={`${metrics.avgHeight.toFixed(2)}m`} />
       </div>
-      <div className="mt-3 pt-3 border-t border-border">
-        <div className="flex items-center justify-between text-[10px] mb-1">
-          <span className="text-muted-foreground tracking-widest">PACKING</span>
-          <span className="text-primary">{(metrics.packingDensity * 100).toFixed(1)}%</span>
+    </div>
+  );
+}
+
+function DensityAnalysis({ peakToPeak, packingDensity }: { peakToPeak: number; packingDensity: number }) {
+  // FIX 7: Target range per d_ij spec: S-S=5.71m, L-L=6.86m
+  const TARGET_MIN = 5.71; // S-S
+  const TARGET_MAX = 6.86; // L-L
+  const inRange = peakToPeak >= TARGET_MIN && peakToPeak <= TARGET_MAX;
+  const rangeColor = peakToPeak === 0 ? "text-muted-foreground" : inRange ? "text-emerald-400" : "text-amber-400";
+  
+  // FIX 6: packingDensity is now 0-100%
+  const packPct = Math.min(100, packingDensity);
+
+  return (
+    <div className="hud-panel p-4 border-emerald-500/30 bg-emerald-500/5">
+      <div className="text-[10px] tracking-widest text-emerald-400 mb-3 flex items-center gap-2">
+        <Activity size={12} /> // PACKING PRECISION
+      </div>
+      
+      <div className="flex flex-col gap-4">
+        <div>
+          <div className="text-[9px] text-muted-foreground tracking-widest uppercase mb-1">Avg Pile Spacing</div>
+          <div className={`text-2xl font-bold hud-glow tabular-nums ${rangeColor}`}>
+            {peakToPeak > 0 ? peakToPeak.toFixed(2) : "---"}<span className="text-xs ml-1 font-normal opacity-70">m</span>
+          </div>
+          <div className="text-[8px] text-muted-foreground mt-1">Target: 5.71m – 6.86m {inRange && peakToPeak > 0 ? "✓" : ""}</div>
         </div>
-        <div className="h-1.5 bg-secondary overflow-hidden">
-          <div
-            className="h-full bg-gradient-to-r from-primary to-primary-glow transition-all"
-            style={{ width: `${Math.min(100, metrics.packingDensity * 100)}%` }}
-          />
+
+        <div className="border-t border-emerald-500/20 pt-3">
+          <div className="flex items-center justify-between text-[10px] mb-1">
+            <span className="text-muted-foreground tracking-widest">FILL DENSITY</span>
+            <span className="text-emerald-400 font-bold">{packPct.toFixed(1)}%</span>
+          </div>
+          <div className="h-1.5 bg-emerald-950 overflow-hidden rounded-full">
+            <div
+              className="h-full bg-gradient-to-r from-emerald-600 to-emerald-400 transition-all duration-1000"
+              style={{ width: `${packPct}%` }}
+            />
+          </div>
+          <div className="text-[8px] text-emerald-500/70 tracking-tighter text-right italic mt-1">
+            TARGET: 87–92% FOR FULL YARD
+          </div>
         </div>
       </div>
     </div>

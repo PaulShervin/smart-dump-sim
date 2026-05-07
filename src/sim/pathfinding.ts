@@ -57,8 +57,10 @@ export function astar(
       if (!opts.ignoreReserved && cell.reserved && !(nx === gx && ny === gy)) continue;
 
       const slopePenalty = cell.slope * 10;
-      // Massive penalty for driving over existing dumps
-      const heightPenalty = cell.height > 0.5 ? cell.height * 50 : cell.height * 2;
+      // Strict avoidance of existing piles: impassable if height > 0.5m
+      if (cell.height > 0.5 && !(nx === gx && ny === gy)) continue;
+      
+      const heightPenalty = cell.height * 10;
       const ng = best.g + cost + slopePenalty + heightPenalty;
       const existing = open.get(k);
       if (!existing || ng < existing.g) {
@@ -95,7 +97,8 @@ export function bfsReachable(
       const k = key(nx, ny);
       if (visited.has(k)) continue;
       const cell = grid[ny][nx];
-      if (cell.slope > SLOPE_LIMIT) continue;
+      // Only reachable if it's mostly flat and NOT a dump pile (height <= 0.5)
+      if (cell.slope > SLOPE_LIMIT || cell.height > 0.5) continue;
       visited.add(k);
       q.push([nx, ny, d + 1]);
     }

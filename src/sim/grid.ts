@@ -4,7 +4,7 @@ import type { GridCell } from "./types";
 
 export const GRID_SIZE = 48; // 48x48 cells
 export const CELL_M = 2; // metres per cell
-export const WORLD_SIZE = GRID_SIZE * CELL_M; // 128m
+export const WORLD_SIZE = GRID_SIZE * CELL_M; // 96m (48 cells × 2m/cell)
 
 export const SLOPE_LIMIT = 0.85;
 export const MAX_PILE_HEIGHT = 10.0;

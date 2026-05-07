@@ -4,10 +4,44 @@ import type { GridCell } from "./types";
 import { GRID_SIZE, SLOPE_LIMIT, MAX_PILE_HEIGHT, gridToWorld, worldToGrid, recomputeSlopesLocal } from "./grid";
 import { bfsReachable } from "./pathfinding";
 
-const W1 = 1.6;   // low-height preference
-const W2 = 0.8;   // proximity to truck
-const W4 = 2.5;   // slope penalty
-const W6 = 5.0;   // furthest from entry (back-to-front packing)
+// FIX 1+2: Effective truck dump radii in grid cells — r = cbrt(volume) × μ where μ=1.0
+// S: cbrt(0.8)=0.928  M: cbrt(1.2)=1.063  L: cbrt(1.8)=1.216
+const TRUCK_RADIUS: Record<"S" | "M" | "L", number> = { S: 0.928, M: 1.063, L: 1.216 };
+
+// FIX T1: Spatial Index for fast slot lookup
+const BUCKET_SIZE = 8;
+const numBuckets = Math.ceil(GRID_SIZE / BUCKET_SIZE);
+export const spatialBuckets: Set<number>[][] = Array(numBuckets).fill(0).map(() => Array(numBuckets).fill(0).map(() => new Set()));
+
+// FIX T2: Dirty flag system for slope recomputation
+export const dirtySlopes = new Set<number>();
+
+export function processDirtySlopes(grid: GridCell[][], maxUpdates = 20) {
+  let count = 0;
+  for (const k of dirtySlopes) {
+    if (count++ >= maxUpdates) break;
+    dirtySlopes.delete(k);
+    const x = k % GRID_SIZE;
+    const y = Math.floor(k / GRID_SIZE);
+    
+    // Recompute local 3x3 slope
+    const hL = grid[y][Math.max(0, x - 1)].height;
+    const hR = grid[y][Math.min(GRID_SIZE - 1, x + 1)].height;
+    const hD = grid[Math.max(0, y - 1)][x].height;
+    const hU = grid[Math.min(GRID_SIZE - 1, y + 1)][x].height;
+    const dx = (hR - hL) / (2 * 2); // CELL_M = 2
+    const dy = (hU - hD) / (2 * 2);
+    grid[y][x].slope = Math.sqrt(dx * dx + dy * dy);
+    grid[y][x].accessibility = grid[y][x].slope <= SLOPE_LIMIT && !grid[y][x].occupied;
+  }
+}
+
+// FIX T3: Reservation Registry
+export const reservationRegistry = new Map<number, number>();
+
+// FIX T4: Global counter for packing density
+export let filledCellCount = 0;
+export function resetFilledCellCount() { filledCellCount = 0; }
 
 export interface DumpCellResult {
   cell: [number, number];
@@ -20,15 +54,11 @@ export function pickDumpCell(
   now: number,
   entryPoint: [number, number] = [2, 2],
   isDemoMode: boolean = false,
-  strategy: "LEGACY" | "MIXED_FLEET" = "LEGACY",
+  strategy: "LEGACY" | "MIXED_FLEET" | "HOMOGENEOUS" = "LEGACY",
   isInsideYard?: (gx: number, gy: number) => boolean
 ): DumpCellResult | null {
   const truckGrid = worldToGrid(truck.position[0], truck.position[2]);
-  // 1. Hexagonal/Staggered Grid: Enforcing exactly 3.03m gap between dumps
-  // Dump diameter is ~4m. 4m + 3.03m gap = 7.03m center-to-center.
-  // 7.03m / 2m per cell = 3.515 cells step.
-  const stepCells = (4.0 + 3.03) / 2.0;
-  const rowStepCells = stepCells * 0.866; // Hexagonal row spacing (sin 60)
+  // FIX 8: Removed dead function-scope stepCells/rowStepCells — redefined inside LEGACY branch below
 
   // 1. Single BFS pass to find all reachable cells from the truck (O(N) = fast)
   const reachable = new Set<number>();
@@ -42,8 +72,8 @@ export function pickDumpCell(
       const nx = cx + dx, ny = cy + dy;
       if (nx >= 0 && nx < GRID_SIZE && ny >= 0 && ny < GRID_SIZE) {
         const k = ny * GRID_SIZE + nx;
-        // Only reachable if it's mostly flat (not a mountain)
-        if (!reachable.has(k) && grid[ny][nx].slope <= SLOPE_LIMIT && grid[ny][nx].height <= 1.0) {
+        // Only reachable if it's mostly flat and NOT a dump pile (height <= 0.5)
+        if (!reachable.has(k) && grid[ny][nx].slope <= SLOPE_LIMIT && grid[ny][nx].height <= 0.5) {
           reachable.add(k);
           q.push([nx, ny]);
         }
@@ -53,10 +83,10 @@ export function pickDumpCell(
 
   let candidates: { x: number; y: number; score: number }[] = [];
 
-  const maxX = isDemoMode ? 22 : GRID_SIZE - 4;
-  const minX = isDemoMode ? 8 : 4;
-  const maxY = isDemoMode ? 18 : GRID_SIZE - 4;
-  const minY = isDemoMode ? 8 : 4;
+  const maxX = isDemoMode ? 22 : GRID_SIZE - 2;
+  const minX = isDemoMode ? 8 : 2;
+  const maxY = isDemoMode ? 18 : GRID_SIZE - 2;
+  const minY = isDemoMode ? 8 : 2;
 
   if (strategy === "LEGACY") {
     // 1. Hexagonal/Staggered Grid: Enforcing exactly 3.03m gap between dumps
@@ -123,127 +153,192 @@ export function pickDumpCell(
     //   6. Row is COMPLETE when every slot (anchor+backfill) is filled
     //   7. Only then move to the next closer row
     //
-    // Truck size determines dump spacing:
-    //   D = r1 + r2 + safety_gap - overlap + margin
-    //   S: 2.0+2.0+1.0-0.5+0.5 = 5.0 cells (10m anchor-to-anchor)
-    //   M: 2.5+2.5+1.0-0.5+0.5 = 6.0 cells (12m anchor-to-anchor)  
-    //   L: 3.0+3.0+1.0-0.5+0.5 = 7.0 cells (14m anchor-to-anchor)
-    // We use a moderate default of 3 cells between slot centers 
-    // (6m real), so anchors are 6 cells (12m) apart with backfill 
-    // slots in the gaps.
+    // FIX 4: Spacing uses actual truck radii: d_ij = r_i + r_j + g - o + m
+    //   g=1.0 (safety gap), o=0.5 (Gaussian overlap), m=0.5 (margin)
+    //   S–S: 0.928+0.928+1.0-0.5+0.5 = 2.856 cells (5.71m)
+    //   S–L: 0.928+1.216+1.0-0.5+0.5 = 3.144 cells (6.29m)
+    //   L–L: 1.216+1.216+1.0-0.5+0.5 = 3.432 cells (6.86m)
+    // ANCHOR phase:   2 × d_ij (leaves gap for backfill)
+    // BACKFILL phase: 1 × d_ij (fills the gap)
 
-    const SLOT_SPACING = 3;   // cells between slot centers (anchor-to-anchor = 6 cells)
-    const ROW_SPACING  = 4;   // cells between rows (8m driving lane)
-
+    // =====================================================================
+    // 1. DYNAMIC ROW PARAMETERS
+    // =====================================================================
+    const ROW_SPACING = 3.044; // FIX 3: Hexagonal — D×sin(60°)=3.515×0.866=3.044 cells (6.09m)
+    const CRESCENT_STRENGTH = 0.0035;
+    
     // --- Generate rows from furthest (maxY) to nearest (minY) ---
     const rows: number[] = [];
     for (let yF = maxY; yF >= minY; yF -= ROW_SPACING) {
       rows.push(Math.round(yF));
     }
 
+    // FIX T6: On-Demand Slot Generation
+    const truckSize = truck.size as "S" | "M" | "L";
+    const isBigTruck = truckSize === "L" || truckSize === "M";
+
     // --- Iterate rows in order (furthest first) ---
     for (const rowY of rows) {
       if (rowY < 0 || rowY >= GRID_SIZE) continue;
 
-      // Row stagger: offset alternate rows by half a slot for interlocking
       const rowIdx = rows.indexOf(rowY);
-      const staggerOffset = (rowIdx % 2 === 0) ? 0 : Math.floor(SLOT_SPACING / 2);
+      const dy = maxY - rowY; // Distance from the back ridge
+      const crescentShift = CRESCENT_STRENGTH * (dy * dy); // Quadratic curve offset
+      const staggerOffset = (rowIdx % 2 === 0) ? 0 : 1.5;
 
-      // --- Generate all slot positions for this row ---
-      const allSlots: { x: number; y: number; isAnchor: boolean }[] = [];
-      let slotIndex = 0;
-      for (let xF = minX + staggerOffset; xF <= maxX; xF += SLOT_SPACING) {
-        const x = Math.round(xF);
-        if (x < 0 || x >= GRID_SIZE) continue;
-        // Skip slots outside the user-drawn dump yard polygon
-        if (isInsideYard && !isInsideYard(x, rowY)) continue;
-        allSlots.push({
-          x,
-          y: rowY,
-          isAnchor: slotIndex % 2 === 0, // even = ANCHOR, odd = BACKFILL
-        });
-        slotIndex++;
-      }
-
-      if (allSlots.length === 0) continue;
-
-      // --- Classify slot states ---
-      const anchorSlots  = allSlots.filter(s => s.isAnchor);
-      const backfillSlots = allSlots.filter(s => !s.isAnchor);
-
-      // A slot is "filled" if terrain height > 0.5m at its position
-      const isFilled = (s: { x: number; y: number }) => {
-        return grid[s.y][s.x].height > 0.5;
-      };
-
-      const allAnchorsFilled = anchorSlots.every(isFilled);
-      const allSlotsFilled   = allSlots.every(isFilled);
-
-      // If this entire row is complete, skip to next row
-      if (allSlotsFilled) continue;
-
-      // --- Size-based role assignment ---
-      // Big trucks (L/M) → ANCHOR role: lay structural foundation piles
-      // Small trucks (S)  → BACKFILL role: fill gaps between anchors
-      const truckSize = truck.size as "S" | "M" | "L";
-      const isBigTruck = truckSize === "L" || truckSize === "M";
-      const filledAnchorCount = anchorSlots.filter(isFilled).length;
-      let availableSlots: { x: number; y: number; isAnchor: boolean }[];
-
-      if (isBigTruck) {
-        // --- BIG TRUCK (L/M): Anchor-first assignment ---
-        const emptyAnchors = anchorSlots.filter(s => !isFilled(s));
-        if (emptyAnchors.length > 0) {
-          // Primary role: fill anchor slots to build the structural ridge
-          availableSlots = emptyAnchors;
-        } else {
-          // All anchors done in this row → big truck can assist with backfill
-          availableSlots = allSlots.filter(s => !isFilled(s));
-        }
-      } else {
-        // --- SMALL TRUCK (S): Backfill-only assignment ---
-        if (filledAnchorCount < 4) {
-          // Not enough anchors placed yet → small truck WAITS (skip this row)
-          // The big trucks need to lay the foundation first
-          continue;
-        }
-        // Enough anchors are in place → small truck fills the gaps
-        const emptyBackfills = backfillSlots.filter(s => !isFilled(s));
-        if (emptyBackfills.length > 0) {
-          availableSlots = emptyBackfills;
-        } else {
-          // All backfill done → help with any remaining slots in this row
-          availableSlots = allSlots.filter(s => !isFilled(s));
+      // Scan existing piles in this row using spatial index (FIX T1 & T6)
+      const pilesInRow: {x: number, y: number, size: string, age: number, isAnchor: boolean}[] = [];
+      const by = Math.floor(rowY / BUCKET_SIZE);
+      if (by >= 0 && by < numBuckets) {
+        for (let bx = 0; bx < numBuckets; bx++) {
+          for (const k of spatialBuckets[by][bx]) {
+            const px = k % GRID_SIZE;
+            const py = Math.floor(k / GRID_SIZE);
+            if (py === rowY) {
+              const c = grid[py][px];
+              if (c.hasDump) {
+                pilesInRow.push({
+                  x: px, 
+                  y: py, 
+                  size: c.isBackfill ? "S" : "L", 
+                  age: c.dumpCompletedAt ? now - c.dumpCompletedAt : 0,
+                  isAnchor: !c.isBackfill
+                });
+              }
+            }
+          }
         }
       }
+      pilesInRow.sort((a, b) => a.x - b.x);
+      const filledAnchors = pilesInRow.filter(p => p.isAnchor).length;
 
-      // --- Filter for reachability, slope, and reservation ---
-      const validSlots = availableSlots.filter(s => {
-        const c = grid[s.y][s.x];
-        if (c.reserved && c.reservedUntil > now) return false;
-        if (c.slope > SLOPE_LIMIT) return false;
-        if (!reachable.has(s.y * GRID_SIZE + s.x)) return false;
-        return true;
-      });
+      let currentX = minX + staggerOffset + crescentShift;
+      let sequenceIdx = 0;
+      let allSlotsFilled = true;
+      const candidates: { cell: [number, number], role: "ANCHOR" | "BACKFILL", distToTruck: number }[] = [];
 
-      if (validSlots.length === 0) {
-        // No valid slots in this row right now (maybe reserved by other trucks)
-        // Still try this row — don't skip to next row
-        continue;
-      }
-
-      // --- Pick the best slot: nearest to truck for fast assignment ---
-      let bestSlot = validSlots[0];
-      let bestDist = Infinity;
-      for (const s of validSlots) {
-        const d = Math.hypot(s.x - truckGrid[0], s.y - truckGrid[1]);
-        if (d < bestDist) {
-          bestDist = d;
-          bestSlot = s;
+      while (currentX <= maxX) {
+        const isAnchorSlot = sequenceIdx % 2 === 0;
+        
+        let nearestPile = null;
+        let minDist = Infinity;
+        for (const p of pilesInRow) {
+           const dist = Math.abs(p.x - currentX);
+           if (dist < minDist) {
+              minDist = dist;
+              nearestPile = p;
+           }
         }
+        
+        const isFilled = minDist < 1.5; // If a pile exists near this sequence position
+        
+        if (!isFilled) {
+           allSlotsFilled = false;
+           // Check if this truck can take this slot
+           let canTake = false;
+           if (isBigTruck && isAnchorSlot) canTake = true;
+           if (!isBigTruck && !isAnchorSlot && filledAnchors >= 4) canTake = true;
+           
+           if (canTake) {
+              let targetX = currentX;
+              if (nearestPile) {
+                 // FIX T5: Pile Age Spacing Multiplier
+                 const spacingMultiplier = nearestPile.age > 0 
+                    ? (nearestPile.age > 20000 ? 0.52 : (nearestPile.age > 8000 ? 0.60 : 0.75)) 
+                    : 1.0;
+                 
+                 const r_i = TRUCK_RADIUS[isAnchorSlot ? "L" : "S"];
+                 const r_j = TRUCK_RADIUS[nearestPile.size as "S" | "M" | "L"];
+                 const d_ij = r_i + r_j + 1.0 - 0.5 + 0.5;
+                 
+                 // FIX 4: ANCHOR phase = 2 * d_ij, BACKFILL phase = 1 * d_ij
+                 const phaseMultiplier = isAnchorSlot ? 2 : 1;
+                 const d_effective = d_ij * spacingMultiplier * phaseMultiplier;
+                 
+                 const sign = nearestPile.x < currentX ? 1 : -1;
+                 targetX = nearestPile.x + sign * d_effective;
+              }
+              
+              const bx = Math.round(targetX);
+              if (bx >= 0 && bx < GRID_SIZE && (!isInsideYard || isInsideYard(bx, rowY))) {
+                 const k = rowY * GRID_SIZE + bx;
+                 const c = grid[rowY][bx];
+                 // If not reserved and reachable, it's a valid candidate!
+                 if (!c.reserved || c.reservedUntil <= now) {
+                    if (c.slope <= SLOPE_LIMIT && reachable.has(k)) {
+                       candidates.push({ 
+                          cell: [bx, rowY], 
+                          role: isAnchorSlot ? "ANCHOR" : "BACKFILL", 
+                          distToTruck: Math.hypot(bx - truckGrid[0], rowY - truckGrid[1]) 
+                       });
+                    }
+                 }
+              }
+           }
+        }
+        
+        const r_curr = TRUCK_RADIUS[isAnchorSlot ? "L" : "S"];
+        const nextIsAnchor = (sequenceIdx + 1) % 2 === 0;
+        const r_next = TRUCK_RADIUS[nextIsAnchor ? "L" : "S"];
+        const d = r_curr + r_next + 1.0 - 0.5 + 0.5;
+        
+        currentX += d;
+        sequenceIdx++;
       }
-
-      return { cell: [bestSlot.x, bestSlot.y], role: bestSlot.isAnchor ? "ANCHOR" as const : "BACKFILL" as const };
+      
+      if (candidates.length > 0) {
+         candidates.sort((a, b) => a.distToTruck - b.distToTruck);
+         return { cell: candidates[0].cell, role: candidates[0].role };
+      }
+      
+      // Big trucks MUST help with backfill if anchors are done (or if row is fully filled with anchors but no candidate found)
+      if (!allSlotsFilled && isBigTruck && filledAnchors >= 4) {
+         // Evaluate backfill slots for big truck as fallback
+         currentX = minX + staggerOffset + crescentShift;
+         sequenceIdx = 0;
+         while (currentX <= maxX) {
+            const isAnchorSlot = sequenceIdx % 2 === 0;
+            if (!isAnchorSlot) {
+               let nearestPile = null;
+               let minDist = Infinity;
+               for (const p of pilesInRow) {
+                  const dist = Math.abs(p.x - currentX);
+                  if (dist < minDist) { minDist = dist; nearestPile = p; }
+               }
+               if (minDist >= 1.5) {
+                  let targetX = currentX;
+                  if (nearestPile) {
+                     const spacingMultiplier = nearestPile.age > 0 ? (nearestPile.age > 20000 ? 0.52 : (nearestPile.age > 8000 ? 0.60 : 0.75)) : 1.0;
+                     const d_ij = TRUCK_RADIUS["S"] + TRUCK_RADIUS[nearestPile.size as "S" | "M" | "L"] + 1.0 - 0.5 + 0.5;
+                     const d_effective = d_ij * spacingMultiplier * 1;
+                     targetX = nearestPile.x + (nearestPile.x < currentX ? 1 : -1) * d_effective;
+                  }
+                  const bx = Math.round(targetX);
+                  if (bx >= 0 && bx < GRID_SIZE && (!isInsideYard || isInsideYard(bx, rowY))) {
+                     const k = rowY * GRID_SIZE + bx;
+                     const c = grid[rowY][bx];
+                     if ((!c.reserved || c.reservedUntil <= now) && c.slope <= SLOPE_LIMIT && reachable.has(k)) {
+                        candidates.push({ cell: [bx, rowY], role: "BACKFILL", distToTruck: Math.hypot(bx - truckGrid[0], rowY - truckGrid[1]) });
+                     }
+                  }
+               }
+            }
+            const r_curr = TRUCK_RADIUS[isAnchorSlot ? "L" : "S"];
+            const nextIsAnchor = (sequenceIdx + 1) % 2 === 0;
+            const r_next = TRUCK_RADIUS[nextIsAnchor ? "L" : "S"];
+            currentX += r_curr + r_next + 1.0 - 0.5 + 0.5;
+            sequenceIdx++;
+         }
+         
+         if (candidates.length > 0) {
+            candidates.sort((a, b) => a.distToTruck - b.distToTruck);
+            return { cell: candidates[0].cell, role: candidates[0].role };
+         }
+      }
+      
+      if (allSlotsFilled) {
+         continue; // Move to next row
+      }
     }
   }
 
@@ -263,7 +358,6 @@ export function reserveFootprint(
   windowMs = 8000
 ) {
   const [cx, cy] = cell;
-  // Reserve a solid 5x5 block to ensure no other trucks collide or enter this 4-grid column
   const radius = 2;
 
   for (let y = cy - radius; y <= cy + radius; y++) {
@@ -271,27 +365,25 @@ export function reserveFootprint(
       if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) continue;
       grid[y][x].reserved = true;
       grid[y][x].reservedUntil = now + windowMs;
+      // FIX T3: Add to registry
+      reservationRegistry.set(y * GRID_SIZE + x, now + windowMs);
     }
   }
 }
 
 export function clearExpiredReservations(grid: GridCell[][], now: number) {
-  for (let y = 0; y < GRID_SIZE; y++) {
-    for (let x = 0; x < GRID_SIZE; x++) {
-      const c = grid[y][x];
-      if (c.reserved && c.reservedUntil <= now) c.reserved = false;
+  // FIX T3: Only scan reserved cells, not all 2304
+  for (const [k, expiry] of reservationRegistry.entries()) {
+    if (expiry <= now) {
+      const x = k % GRID_SIZE;
+      const y = Math.floor(k / GRID_SIZE);
+      grid[y][x].reserved = false;
+      reservationRegistry.delete(k);
     }
   }
 }
 
-// Material properties: Gaussian distributions
-// Coal: Base spread (k=1.8), wide ellipse (matFactor=1.2), normal peak (peakFactor=1.0)
-// Iron Ore: Dense spread (k=1.4), tight ellipse (matFactor=0.9), high peak (peakFactor=1.3)
-// Limestone: Moderate spread (k=1.6), circular (matFactor=1.0), moderate peak (peakFactor=1.1)
-// Overburden: Loose spread (k=2.0), wide ellipse (matFactor=1.3), low peak (peakFactor=0.9)
-const k = 1.4;
-const matFactor = 0.9;
-const peakFactor = 1.3;
+// FIX 8: Removed dead module-level k, matFactor, peakFactor (shadowed by locals in applyDump)
 
 // Apply material to grid as a 2D Gaussian distribution
 export function applyDump(
@@ -301,7 +393,10 @@ export function applyDump(
   material: string = "OVERBURDEN"
 ): [number, number][] {
   const [cx, cy] = cell;
+  // FIX 5: Mark center cell as occupied so A* and accessibility treat it as blocked
   grid[cy][cx].hasDump = true;
+  grid[cy][cx].occupied = true;
+  grid[cy][cx].accessibility = grid[cy][cx].slope <= SLOPE_LIMIT && false; // occupied=true → always false
   const isBackfill = truck.role === "BACKFILL";
   grid[cy][cx].isBackfill = isBackfill;
 
@@ -323,12 +418,13 @@ export function applyDump(
   else if (material === "LIMESTONE") { matFactor = 1.05; peakFactor = 1.05; }
   else { matFactor = 1.15; peakFactor = 0.9; }
 
-  // Constrain spread so dumps overlap into a continuous ridge (Windrow)
-  const rx = v13 * 1.0 * jitterRx * matFactor;
-  const ry = v13 * 1.0 * jitterRy * matFactor;
+  // FIX 1: Spread σx/σy = r × matFactor × jitter. Multiplier μ=1.0 (NOT 1.15).
+  const rx = v13 * jitterRx * matFactor;
+  const ry = v13 * jitterRy * matFactor;
 
-  // Set the peak height to target ~4.5m for clear visual ridges
-  const peakAdd = v13 * 4.5 * jitterPeak * peakFactor;
+  // Backfill optimization: target 85% of anchor peak to fill valleys smoothly
+  const backfillDamping = isBackfill ? 0.85 : 1.0;
+  const peakAdd = v13 * 4.5 * jitterPeak * peakFactor * backfillDamping;
 
   // Strict radius of 2 ensures it NEVER touches the truck parked 3 cells away!
   const radius = 2;
@@ -344,7 +440,13 @@ export function applyDump(
       const expNode = Math.exp(-((dx * dx) / (2 * rx * rx) + (dy * dy) / (2 * ry * ry)));
       const gaussianHeight = grid[y][x].height + peakAdd * expNode;
       
+      // FIX T4: Update filledCellCount incrementally
+      const wasBelow = grid[y][x].height <= 1.2;
       grid[y][x].height = Math.min(MAX_PILE_HEIGHT, gaussianHeight);
+      if (wasBelow && grid[y][x].height > 1.2) {
+        filledCellCount++;
+      }
+      
       if (grid[y][x].height > 0.1) {
         // assign material to the cell if it's the core of the dump
         if (!grid[y][x].material || gaussianHeight > grid[y][x].height - 1.5) {
@@ -354,8 +456,16 @@ export function applyDump(
         }
       }
       affected.push([x, y]);
+      // FIX T2: Mark cells as dirty instead of synchronously recomputing slopes
+      dirtySlopes.add(y * GRID_SIZE + x);
     }
   }
-  recomputeSlopesLocal(grid, cx, cy, radius + 1);
+  // FIX T1: Add pile center to spatial index
+  const bx = Math.floor(cx / BUCKET_SIZE);
+  const by = Math.floor(cy / BUCKET_SIZE);
+  if (bx >= 0 && bx < numBuckets && by >= 0 && by < numBuckets) {
+    spatialBuckets[by][bx].add(cy * GRID_SIZE + cx);
+  }
+  // Removed recomputeSlopesLocal(grid, cx, cy, radius + 1)
   return affected;
 }

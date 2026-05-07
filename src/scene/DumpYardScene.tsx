@@ -231,8 +231,6 @@ export function DumpYardScene() {
       </Canvas>
 
       <HudOverlay
-        truckCount={targetTruckCount}
-        onTruckCountChange={setTargetTruckCount}
         simSpeed={simSpeed}
         onSimSpeedChange={setSimSpeed}
         metrics={state.metrics}
@@ -247,7 +245,6 @@ export function DumpYardScene() {
         selectedMaterial={selectedMaterial}
         onSelectedMaterialChange={setSelectedMaterial}
         packingStrategy={packingStrategy}
-        onPackingStrategyChange={setPackingStrategy}
         isNight={isNight}
         onToggleNight={() => setIsNight(!isNight)}
         gridRef={gridRef}

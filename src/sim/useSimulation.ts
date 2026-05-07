@@ -8,7 +8,7 @@ import {
 } from "@/sim/grid";
 import { astar } from "@/sim/pathfinding";
 import {
-  pickDumpCell, reserveFootprint, clearExpiredReservations, applyDump,
+  pickDumpCell, reserveFootprint, clearExpiredReservations, applyDump, processDirtySlopes, filledCellCount, resetFilledCellCount
 } from "@/sim/dumpEngine";
 
 const TRUCK_COLORS = ["#fbb414", "#fcd34d", "#fbbf24", "#f59e0b", "#d97706", "#eab308", "#ca8a04", "#a16207"]; // CAT Industrial Yellow
@@ -41,6 +41,8 @@ function makeTrucksFromFleet(fleet: FleetConfig, materialOverride: string, entry
       const entry = entryOverride || ENTRY_POINTS[0];
       const [wx, wz] = gridToWorld(entry[0], entry[1]);
       const mat = materialOverride === "MIXED" ? MATERIALS[idx % MATERIALS.length] : (materialOverride as any);
+      const sizeColors = { S: "#06b6d4", M: "#d946ef", L: "#84cc16" }; // Cyan, Magenta, Lime
+      const color = sizeColors[model.size] || "#fbb414";
       trucks.push({
         id: `T-${(idx + 1).toString().padStart(2, "0")}`,
         state: "IDLE",
@@ -49,7 +51,7 @@ function makeTrucksFromFleet(fleet: FleetConfig, materialOverride: string, entry
         speed: 0,
         load: 1,
         size: model.size,
-        color: TRUCK_COLORS[idx % TRUCK_COLORS.length],
+        color: color,
         material: mat,
         path: [],
         pathIndex: 0,
@@ -80,7 +82,7 @@ export interface SimState {
 
 const TRUCK_SPEED_MPS = 6; // metres/sec
 
-export type PackingStrategy = "LEGACY" | "MIXED_FLEET";
+export type PackingStrategy = "LEGACY" | "MIXED_FLEET" | "HOMOGENEOUS";
 
 export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefObject<DumpYardConfig | null>) {
   const gridRef = useRef<GridCell[][]>(makeGrid());
@@ -108,11 +110,16 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
     });
   };
 
-  const [packingStrategy, setPackingStrategyState] = useState<PackingStrategy>("LEGACY");
-  const packingStrategyRef = useRef<PackingStrategy>("LEGACY");
-  const setPackingStrategy = (s: PackingStrategy) => {
-    packingStrategyRef.current = s;
-    setPackingStrategyState(s);
+  const [packingStrategy, setPackingStrategyState] = useState<PackingStrategy>("HOMOGENEOUS");
+  const packingStrategyRef = useRef<PackingStrategy>("HOMOGENEOUS");
+  
+  const updateAutoStrategy = (fleet: FleetConfig) => {
+    const activeModels = TRUCK_MODELS.filter(m => fleet[m.id] > 0);
+    const uniqueSizes = new Set(activeModels.map(m => m.size));
+    const nextStrategy: PackingStrategy = uniqueSizes.size > 1 ? "MIXED_FLEET" : "HOMOGENEOUS";
+    
+    packingStrategyRef.current = nextStrategy;
+    setPackingStrategyState(nextStrategy);
   };
 
   const setFleetConfig = (fc: FleetConfig) => {
@@ -122,12 +129,16 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
     setTargetTruckCount(newTotal);
     // Rebuild trucks from fleet config
     trucksRef.current = makeTrucksFromFleet(fc, selectedMaterialRef.current);
+    // Update strategy automatically
+    updateAutoStrategy(fc);
+    
     // Reset grid for fair comparison
     gridRef.current = makeGrid();
     eventsRef.current = [];
     tickRef.current = 0;
     cycleSamplesRef.current = [];
     dumpTimestampsRef.current = [];
+    resetFilledCellCount(); // FIX T4: reset global counter
   };
 
   const setSimSpeed = (speed: number) => {
@@ -146,12 +157,15 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
     
     if (val) {
       setTargetTruckCount(1);
-      trucksRef.current = makeTrucksFromFleet({ CAT_789D: 1 }, selectedMaterialRef.current);
+      const demoFleet = { CAT_789D: 1 };
+      trucksRef.current = makeTrucksFromFleet(demoFleet, selectedMaterialRef.current);
+      updateAutoStrategy(demoFleet);
     } else {
       const fc = fleetConfigRef.current;
       const n = totalFromFleet(fc);
       setTargetTruckCount(n);
       trucksRef.current = makeTrucksFromFleet(fc, selectedMaterialRef.current);
+      updateAutoStrategy(fc);
     }
   };
 
@@ -160,7 +174,7 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
     trucks: trucksRef.current,
     events: [],
     tick: 0,
-    metrics: { totalDumps: 0, avgHeight: 0, utilization: 0, activeTrucks: 0, packingDensity: 0, throughput: 0, avgCycleMs: 0 },
+    metrics: { totalDumps: 0, avgHeight: 0, utilization: 0, activeTrucks: 0, packingDensity: 0, throughput: 0, avgCycleMs: 0, peakToPeak: 0 },
   }));
 
   const lastTimeRef = useRef(performance.now());
@@ -219,33 +233,80 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const lastMetricsTimeRef = useRef(0);
+  const prevMetricsRef = useRef<Metrics | null>(null);
+
   function computeMetrics(now: number): Metrics {
+    if (now - lastMetricsTimeRef.current < 1000 && prevMetricsRef.current) {
+      return prevMetricsRef.current;
+    }
+    lastMetricsTimeRef.current = now;
+
     const g = gridRef.current;
-    let sum = 0, filled = 0;
-    const total = GRID_SIZE * GRID_SIZE;
-    for (let y = 0; y < GRID_SIZE; y++)
+    const yardCfg = dumpYardRef?.current;
+    
+    let sumH = 0, filledInside = 0, totalInside = 0;
+    
+    for (let y = 0; y < GRID_SIZE; y++) {
       for (let x = 0; x < GRID_SIZE; x++) {
         const h = g[y][x].height;
-        sum += h;
-        if (h > 1.2) filled++;
+        const inside = yardCfg?.isFinalized ? yardCfg.isInsideYard(x, y) : true;
+        
+        if (inside) {
+          sumH += h;
+          totalInside++;
+          if (h > 1.2) filledInside++;
+        }
       }
-    const avgHeight = sum / total;
-    const utilization = filled / total;
-    const packingDensity = avgHeight / MAX_PILE_HEIGHT;
+    }
+
+    const avgHeight = totalInside > 0 ? sumH / totalInside : 0;
+    const utilization = totalInside > 0 ? filledInside / totalInside : 0;
+    // FIX T4: Using O(1) global counter for packing density
+    const packingDensity = totalInside > 0 ? (filledCellCount / totalInside) * 100 : 0;
+    
     const recent = dumpTimestampsRef.current.filter(t => now - t < 60000);
     dumpTimestampsRef.current = recent;
     const throughput = recent.length;
     const cs = cycleSamplesRef.current.slice(-20);
     const avgCycleMs = cs.length ? cs.reduce((a, b) => a + b, 0) / cs.length : 0;
-    return {
+    
+    // FIX 7: peakToPeak = avg nearest-neighbor distance between hasDump=true pile centres
+    let peakToPeak = 0;
+    const dumpCells: [number, number][] = [];
+    const g2 = gridRef.current;
+    for (let y = 0; y < GRID_SIZE; y++)
+      for (let x = 0; x < GRID_SIZE; x++)
+        if (g2[y][x].hasDump) dumpCells.push([x, y]);
+
+    if (dumpCells.length > 1) {
+      let sumNN = 0;
+      for (const [x1, y1] of dumpCells) {
+        let minD = Infinity;
+        for (const [x2, y2] of dumpCells) {
+          if (x1 === x2 && y1 === y2) continue;
+          const d = Math.hypot((x1 - x2) * CELL_M, (y1 - y2) * CELL_M);
+          if (d < minD) minD = d;
+        }
+        if (minD < Infinity) sumNN += minD;
+      }
+      peakToPeak = sumNN / dumpCells.length; // avg nearest-neighbour distance in metres
+    }
+
+    const res = {
       totalDumps: trucksRef.current.reduce((s, t) => s + t.totalDumps, 0),
       avgHeight, utilization, packingDensity, throughput, avgCycleMs,
       activeTrucks: trucksRef.current.filter(t => t.state !== "IDLE").length,
+      peakToPeak,
     };
+    prevMetricsRef.current = res;
+    return res;
   }
 
   function step(dt: number, now: number) {
     clearExpiredReservations(gridRef.current, now);
+    // FIX T2: Process dirty slopes
+    processDirtySlopes(gridRef.current, 20);
     for (const truck of trucksRef.current) {
       stepTruck(truck, dt, now);
     }
@@ -347,7 +408,7 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
       if (truck.dumpProgress >= 1 && truck.target) {
         // Apply material
         applyDump(grid, truck.target, truck, truck.material);
-        recomputeSlopesLocal(grid, truck.target[0], truck.target[1], 5);
+        // FIX T2: No synchronous recomputeSlopesLocal here; dirty system handles it.
         truck.totalDumps++;
         eventIdRef.current++;
         eventsRef.current.push({
@@ -369,6 +430,12 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
         truck.state = "RETURNING";
         truck.bedTilt = 0;
         truck.dumpProgress = 0;
+        
+        // FIX T5: Confirm pile age tracking
+        const cell = grid[truck.target[1]][truck.target[0]];
+        cell.isConfirmedPile = true;
+        cell.dumpCompletedAt = now;
+        
         truck.target = undefined;
       }
     }
@@ -398,7 +465,6 @@ export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefO
     selectedMaterial, 
     setSelectedMaterial,
     packingStrategy,
-    setPackingStrategy,
     isDemoMode,
     setIsDemoMode,
     fleetConfig,

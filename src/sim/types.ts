@@ -33,6 +33,8 @@ export interface GridCell {
   material?: MaterialType;
   hasDump?: boolean;
   isBackfill?: boolean; // true if this dump was placed as a backfill (gap-fill) operation
+  dumpCompletedAt?: number;
+  isConfirmedPile?: boolean;
 }
 
 export type TruckState = "MOVING" | "ARRIVED" | "DUMPING" | "RETURNING" | "IDLE";
@@ -75,4 +77,5 @@ export interface Metrics {
   packingDensity: number;
   throughput: number; // dumps/min
   avgCycleMs: number;
+  peakToPeak: number; // meters
 }
