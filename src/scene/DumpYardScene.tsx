@@ -1,5 +1,5 @@
 // Main scene wrapper + camera controller (default isometric, follow-truck mode).
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
@@ -9,11 +9,14 @@ import { PathLines, ReservationMarkers, DustParticles, V2XBeams, RockRubble } fr
 import { HudOverlay } from "@/components/HudOverlay";
 import { FleetMonitors } from "@/components/FleetMonitors";
 import { useSimulation } from "@/sim/useSimulation";
+import type { DumpYardConfig } from "@/sim/useSimulation";
 import { WORLD_SIZE } from "@/sim/grid";
 import { useMeasurementStore } from "@/hooks/useMeasurementStore";
+import { useDumpYardStore } from "@/hooks/useDumpYardStore";
 import { MeasurementMarker } from "@/components/MeasurementMarker";
 import { MeasurementLine } from "@/components/MeasurementLine";
 import { euclideanDistance } from "@/lib/distanceMeasurement";
+import { DumpYardBoundary } from "@/scene/DumpYardBoundary";
 
 export type CameraView = "ADMIN" | "TOP" | "SIDE" | "VEHICLE" | "FLEET";
 
@@ -57,13 +60,50 @@ function CameraRig({ cameraView, trucks }: { cameraView: CameraView; trucks: any
 }
 
 export function DumpYardScene() {
-  const { state, gridRef, targetTruckCount, setTargetTruckCount, simSpeed, setSimSpeed, selectedMaterial, setSelectedMaterial, packingStrategy, setPackingStrategy, isDemoMode, setIsDemoMode, fleetConfig, setFleetConfig } = useSimulation(5);
+  // ── Dump Yard Store ──
+  const {
+    state: dumpYardState,
+    stateRef: dumpYardStateRef,
+    startDrawing,
+    addVertex,
+    undoLastVertex,
+    finishPolygon,
+    setEntryPoint,
+    resetYard,
+    isInsideYard,
+  } = useDumpYardStore();
+
+  // Build a ref that the simulation loop can read synchronously
+  const dumpYardConfigRef = useRef<DumpYardConfig | null>(null);
+
+  // Keep config ref in sync with dump yard state
+  useEffect(() => {
+    const s = dumpYardState;
+    if (s.isFinalized) {
+      dumpYardConfigRef.current = {
+        entryGrid: s.entryGrid,
+        isInsideYard,
+        isFinalized: true,
+      };
+    } else {
+      dumpYardConfigRef.current = null;
+    }
+  }, [dumpYardState, isInsideYard]);
+
+  const {
+    state, gridRef, targetTruckCount, setTargetTruckCount,
+    simSpeed, setSimSpeed, selectedMaterial, setSelectedMaterial,
+    packingStrategy, setPackingStrategy, isDemoMode, setIsDemoMode,
+    fleetConfig, setFleetConfig, resetToEntryPoint,
+    isRunning, startSim, pauseSim, resumeSim,
+  } = useSimulation(5, dumpYardConfigRef);
+
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [showEmptyGrid, setShowEmptyGrid] = useState(false);
   const [cameraView, setCameraView] = useState<CameraView>("ADMIN");
   const [isNight, setIsNight] = useState(false);
 
-  // Measurement State
+  // ── Measurement ──
   const {
     state: mState,
     startSelection,
@@ -75,14 +115,37 @@ export function DumpYardScene() {
   } = useMeasurementStore();
 
   const isMeasuring = mState.step !== "idle";
+  const isDrawingYard = dumpYardState.mode === "drawing";
+  const isPlacingEntry = dumpYardState.mode === "placing_entry";
   const liveDistance = mState.pointA && mState.pointB ? euclideanDistance(mState.pointA, mState.pointB) : null;
 
+  // When dump yard is finalized, reset simulation to the new entry point
+  const prevFinalizedRef = useRef(false);
+  useEffect(() => {
+    if (dumpYardState.isFinalized && !prevFinalizedRef.current) {
+      resetToEntryPoint(dumpYardState.entryGrid);
+    }
+    prevFinalizedRef.current = dumpYardState.isFinalized;
+  }, [dumpYardState.isFinalized, dumpYardState.entryGrid, resetToEntryPoint]);
+
   const handleCanvasClick = (e: any) => {
-    if (!isMeasuring) return;
     e.stopPropagation();
     const pt = { x: e.point.x, y: e.point.y, z: e.point.z };
-    if (mState.step === "selectingA") setPointA(pt);
-    else if (mState.step === "selectingB") setPointB(pt);
+
+    // Priority: dump yard drawing > entry point placement > measurement
+    if (isDrawingYard) {
+      addVertex({ x: pt.x, z: pt.z });
+      return;
+    }
+    if (isPlacingEntry) {
+      setEntryPoint({ x: pt.x, z: pt.z });
+      return;
+    }
+    if (isMeasuring) {
+      if (mState.step === "selectingA") setPointA(pt);
+      else if (mState.step === "selectingB") setPointB(pt);
+      return;
+    }
   };
 
   return (
@@ -131,6 +194,9 @@ export function DumpYardScene() {
           onClick={handleCanvasClick}
         />
         <GridOverlay />
+
+        {/* Dynamic Dump Yard Boundary Visuals */}
+        <DumpYardBoundary dumpYardState={dumpYardState} />
 
         {/* Measurement Visuals */}
         {mState.pointA && (
@@ -195,6 +261,19 @@ export function DumpYardScene() {
           analyse,
           reset: resetMeasurement,
           clearHistory,
+        }}
+        dumpYard={{
+          state: dumpYardState,
+          startDrawing,
+          undoLastVertex,
+          finishPolygon,
+          resetYard,
+        }}
+        simControl={{
+          isRunning,
+          startSim,
+          pauseSim,
+          resumeSim,
         }}
       />
 

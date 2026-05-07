@@ -14,8 +14,14 @@ import {
 const TRUCK_COLORS = ["#fbb414", "#fcd34d", "#fbbf24", "#f59e0b", "#d97706", "#eab308", "#ca8a04", "#a16207"]; // CAT Industrial Yellow
 const MATERIALS: ("COAL" | "IRON_ORE" | "LIMESTONE" | "OVERBURDEN")[] = ["COAL", "IRON_ORE", "LIMESTONE", "OVERBURDEN", "IRON_ORE"];
 const ENTRY_POINTS: [number, number][] = [
-  [2, 2], // Single entry/exit point for all trucks
+  [2, 2], // Default single entry/exit point for all trucks
 ];
+
+export interface DumpYardConfig {
+  entryGrid: [number, number];
+  isInsideYard: (gx: number, gy: number) => boolean;
+  isFinalized: boolean;
+}
 
 const DEFAULT_FLEET: FleetConfig = {
   CAT_777G: 1,
@@ -26,13 +32,13 @@ const DEFAULT_FLEET: FleetConfig = {
   CAT_794AC: 0,
 };
 
-function makeTrucksFromFleet(fleet: FleetConfig, materialOverride: string): Truck[] {
+function makeTrucksFromFleet(fleet: FleetConfig, materialOverride: string, entryOverride?: [number, number]): Truck[] {
   const trucks: Truck[] = [];
   let idx = 0;
   for (const model of TRUCK_MODELS) {
     const count = fleet[model.id] || 0;
     for (let k = 0; k < count; k++) {
-      const entry = ENTRY_POINTS[0];
+      const entry = entryOverride || ENTRY_POINTS[0];
       const [wx, wz] = gridToWorld(entry[0], entry[1]);
       const mat = materialOverride === "MIXED" ? MATERIALS[idx % MATERIALS.length] : (materialOverride as any);
       trucks.push({
@@ -76,7 +82,7 @@ const TRUCK_SPEED_MPS = 6; // metres/sec
 
 export type PackingStrategy = "LEGACY" | "MIXED_FLEET";
 
-export function useSimulation(initialTrucks = 5) {
+export function useSimulation(initialTrucks = 5, dumpYardRef?: React.MutableRefObject<DumpYardConfig | null>) {
   const gridRef = useRef<GridCell[][]>(makeGrid());
   const [fleetConfig, setFleetConfigState] = useState<FleetConfig>(DEFAULT_FLEET);
   const fleetConfigRef = useRef<FleetConfig>(DEFAULT_FLEET);
@@ -159,7 +165,24 @@ export function useSimulation(initialTrucks = 5) {
 
   const lastTimeRef = useRef(performance.now());
   const tickRef = useRef(0);
-  const runningRef = useRef(true);
+  const runningRef = useRef(false);
+
+  const [isRunning, setIsRunningState] = useState(false);
+
+  const startSim = () => {
+    runningRef.current = true;
+    setIsRunningState(true);
+  };
+
+  const pauseSim = () => {
+    runningRef.current = false;
+    setIsRunningState(false);
+  };
+
+  const resumeSim = () => {
+    runningRef.current = true;
+    setIsRunningState(true);
+  };
 
   useEffect(() => {
     // Fleet is now rebuilt entirely via setFleetConfig,
@@ -239,8 +262,10 @@ export function useSimulation(initialTrucks = 5) {
       }
       
       // Plan: pick a dump cell
-      const entry = ENTRY_POINTS[0];
-      const result = pickDumpCell(grid, truck, now, entry, isDemoModeRef.current, packingStrategyRef.current);
+      const yardCfg = dumpYardRef?.current;
+      const entry: [number, number] = yardCfg?.isFinalized ? yardCfg.entryGrid : ENTRY_POINTS[0];
+      const isInsideYard = yardCfg?.isFinalized ? yardCfg.isInsideYard : undefined;
+      const result = pickDumpCell(grid, truck, now, entry, isDemoModeRef.current, packingStrategyRef.current, isInsideYard);
       if (!result) return;
       const target = result.cell;
       truck.role = result.role;
@@ -335,7 +360,8 @@ export function useSimulation(initialTrucks = 5) {
         dumpTimestampsRef.current.push(now);
 
         // Plan return
-        const entry = ENTRY_POINTS[0];
+        const yardCfg2 = dumpYardRef?.current;
+        const entry: [number, number] = yardCfg2?.isFinalized ? yardCfg2.entryGrid : ENTRY_POINTS[0];
         const [tgx2, tgy2] = worldToGrid(truck.position[0], truck.position[2]);
         const path = astar(grid, [tgx2, tgy2], entry, { ignoreReserved: true });
         truck.path = path && path.length > 1 ? path : [[tgx2, tgy2], entry];
@@ -346,6 +372,19 @@ export function useSimulation(initialTrucks = 5) {
         truck.target = undefined;
       }
     }
+  }
+
+  /** Reset simulation and move all trucks to a new entry point (called when dump yard is finalized) */
+  function resetToEntryPoint(entry: [number, number]) {
+    // Pause sim — user must click START to begin dumping
+    runningRef.current = false;
+    setIsRunningState(false);
+    gridRef.current = makeGrid();
+    eventsRef.current = [];
+    tickRef.current = 0;
+    cycleSamplesRef.current = [];
+    dumpTimestampsRef.current = [];
+    trucksRef.current = makeTrucksFromFleet(fleetConfigRef.current, selectedMaterialRef.current, entry);
   }
 
   return { 
@@ -364,6 +403,11 @@ export function useSimulation(initialTrucks = 5) {
     setIsDemoMode,
     fleetConfig,
     setFleetConfig,
+    resetToEntryPoint,
+    isRunning,
+    startSim,
+    pauseSim,
+    resumeSim,
   };
 }
 

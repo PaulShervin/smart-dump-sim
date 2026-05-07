@@ -6,6 +6,7 @@ import type { Zone } from "@/sim/voronoi";
 import { REASSIGN_THRESHOLD } from "@/sim/voronoi";
 import { DemoAvatar } from "./DemoAvatar";
 import type { MeasurementState } from "@/hooks/useMeasurementStore";
+import type { DumpYardState } from "@/hooks/useDumpYardStore";
 
 interface Props {
   truckCount: number;
@@ -39,9 +40,22 @@ interface Props {
     reset: () => void;
     clearHistory: () => void;
   };
+  dumpYard?: {
+    state: DumpYardState;
+    startDrawing: () => void;
+    undoLastVertex: () => void;
+    finishPolygon: () => void;
+    resetYard: () => void;
+  };
+  simControl?: {
+    isRunning: boolean;
+    startSim: () => void;
+    pauseSim: () => void;
+    resumeSim: () => void;
+  };
 }
 
-export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpeedChange, metrics, trucks, events, showHeatmap, onToggleHeatmap, showEmptyGrid, onToggleEmptyGrid, cameraView, onCameraViewChange, selectedMaterial, onSelectedMaterialChange, packingStrategy, onPackingStrategyChange, isNight, onToggleNight, gridRef, isDemoMode, onToggleDemoMode, measurement, fleetConfig, onFleetConfigChange }: Props) {
+export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpeedChange, metrics, trucks, events, showHeatmap, onToggleHeatmap, showEmptyGrid, onToggleEmptyGrid, cameraView, onCameraViewChange, selectedMaterial, onSelectedMaterialChange, packingStrategy, onPackingStrategyChange, isNight, onToggleNight, gridRef, isDemoMode, onToggleDemoMode, measurement, fleetConfig, onFleetConfigChange, dumpYard, simControl }: Props) {
   const [showFleetPanel, setShowFleetPanel] = useState(false);
   const totalTrucks = Object.values(fleetConfig).reduce((s, n) => s + n, 0);
   return (
@@ -56,6 +70,29 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
           <span className="text-[10px] text-muted-foreground tracking-widest">
             AUTONOMOUS DUMP YARD · DIGITAL TWIN v1.0
           </span>
+
+          {/* ── START / PAUSE / RESUME ── */}
+          {simControl && (
+            <div className="flex items-center gap-2 ml-2">
+              {!simControl.isRunning ? (
+                <button
+                  onClick={simControl.startSim}
+                  className="px-5 py-2 border-2 border-emerald-500 text-emerald-400 tracking-[0.3em] transition font-black text-sm hover:bg-emerald-500/20 flex items-center gap-2"
+                  style={{ boxShadow: '0 0 20px rgba(16,185,129,0.25), inset 0 0 15px rgba(16,185,129,0.08)' }}
+                >
+                  <span className="text-lg">▶</span> START
+                </button>
+              ) : (
+                <button
+                  onClick={simControl.pauseSim}
+                  className="px-5 py-2 border-2 border-amber-500 text-amber-400 tracking-[0.3em] transition font-black text-sm hover:bg-amber-500/20 flex items-center gap-2"
+                  style={{ boxShadow: '0 0 20px rgba(245,158,11,0.25), inset 0 0 15px rgba(245,158,11,0.08)' }}
+                >
+                  <span className="text-lg">⏸</span> PAUSE
+                </button>
+              )}
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-4 text-[10px]">
           <div className="flex flex-col gap-1 mr-4">
@@ -252,8 +289,69 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
               MEASURE {measurement.state.step !== "idle" ? "ON" : "OFF"}
             </button>
           )}
-          <div className="px-3 py-1.5 border border-border text-muted-foreground tracking-widest">
-            STATUS: <span className="text-primary">ONLINE</span>
+
+          {/* Dynamic Dump Yard Controls */}
+          {dumpYard && (
+            <>
+              {dumpYard.state.mode === "idle" && (
+                <button
+                  onClick={dumpYard.startDrawing}
+                  className="px-3 py-1.5 border border-amber-500/50 text-amber-400 hover:bg-amber-500/10 tracking-widest transition font-bold flex items-center gap-1.5"
+                >
+                  <span className="text-base">✏️</span> DRAW DUMP YARD
+                </button>
+              )}
+              {dumpYard.state.mode === "drawing" && (
+                <div className="flex items-center gap-1">
+                  <span className="text-[9px] text-amber-400 tracking-widest animate-pulse">DRAWING ({dumpYard.state.polygon.length} pts)</span>
+                  {dumpYard.state.polygon.length > 0 && (
+                    <button
+                      onClick={dumpYard.undoLastVertex}
+                      className="px-2 py-1 border border-amber-500/40 text-amber-400 text-[9px] tracking-widest hover:bg-amber-500/10 transition"
+                    >
+                      UNDO
+                    </button>
+                  )}
+                  {dumpYard.state.polygon.length >= 3 && (
+                    <button
+                      onClick={dumpYard.finishPolygon}
+                      className="px-2 py-1 border border-emerald-500 text-emerald-400 text-[9px] tracking-widest hover:bg-emerald-500/10 transition font-bold"
+                    >
+                      FINISH POLYGON
+                    </button>
+                  )}
+                </div>
+              )}
+              {dumpYard.state.mode === "placing_entry" && (
+                <span className="px-3 py-1.5 border border-cyan-500 text-cyan-400 tracking-widest text-[9px] animate-pulse font-bold">
+                  ⬇️ CLICK TERRAIN TO SET ENTRY POINT
+                </span>
+              )}
+              {dumpYard.state.mode === "active" && (
+                <div className="flex items-center gap-1">
+                  <span className="px-3 py-1.5 border border-emerald-500/50 text-emerald-400 tracking-widest text-[9px] font-bold">
+                    ✅ YARD ACTIVE ({dumpYard.state.insideCells.size} cells)
+                  </span>
+                  <button
+                    onClick={dumpYard.resetYard}
+                    className="px-2 py-1 border border-red-500/40 text-red-400 text-[9px] tracking-widest hover:bg-red-500/10 transition"
+                  >
+                    RESET
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+
+          <div className={`px-3 py-1.5 border tracking-widest ${
+            simControl?.isRunning 
+              ? 'border-emerald-500/50 text-muted-foreground' 
+              : 'border-amber-500/50 text-muted-foreground'
+          }`}>
+            STATUS: {simControl?.isRunning 
+              ? <span className="text-emerald-400">RUNNING</span> 
+              : <span className="text-amber-400">PAUSED</span>
+            }
           </div>
         </div>
       </header>
@@ -343,6 +441,66 @@ export function HudOverlay({ truckCount, onTruckCountChange, simSpeed, onSimSpee
             >
               Cancel / Reset
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Dump Yard Drawing Status Overlay */}
+      {dumpYard && (dumpYard.state.mode === "drawing" || dumpYard.state.mode === "placing_entry") && (
+        <div className="pointer-events-auto absolute bottom-24 left-1/2 -translate-x-1/2 flex flex-col items-center gap-3">
+          <div className="hud-panel p-5 flex flex-col items-center gap-3 border-amber-500/50 bg-background/80 backdrop-blur-md shadow-[0_0_30px_rgba(245,158,11,0.2)] min-w-[340px]">
+            <div className="text-[11px] tracking-[0.2em] text-amber-400 font-bold uppercase flex items-center gap-2">
+              {dumpYard.state.mode === "drawing" && (
+                <>
+                  <span className="h-2.5 w-2.5 rounded-full bg-amber-400 animate-pulse" style={{ boxShadow: '0 0 10px #f59e0b' }} />
+                  DRAWING DUMP YARD BOUNDARY
+                </>
+              )}
+              {dumpYard.state.mode === "placing_entry" && (
+                <>
+                  <span className="h-2.5 w-2.5 rounded-full bg-cyan-400 animate-pulse" style={{ boxShadow: '0 0 10px #22d3ee' }} />
+                  <span className="text-cyan-400">SET ENTRY POINT</span>
+                </>
+              )}
+            </div>
+
+            <div className="text-[10px] text-muted-foreground tracking-wider text-center max-w-xs">
+              {dumpYard.state.mode === "drawing" &&
+                "Click on the terrain to place polygon vertices. At least 3 points needed to define the dump yard area."
+              }
+              {dumpYard.state.mode === "placing_entry" &&
+                "Click on the terrain to place the entry point. All trucks will start and return from this location."
+              }
+            </div>
+
+            {/* Polygon vertices */}
+            {dumpYard.state.polygon.length > 0 && (
+              <div className="flex flex-wrap gap-2 justify-center mt-1">
+                {dumpYard.state.polygon.map((p, i) => (
+                  <div key={i} className="px-2 py-1 border border-amber-500/30 bg-amber-500/5 text-[9px] font-mono text-amber-300">
+                    V{i + 1}: ({p.x.toFixed(1)}, {p.z.toFixed(1)})
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="flex gap-3 mt-2">
+              {dumpYard.state.mode === "drawing" && dumpYard.state.polygon.length >= 3 && (
+                <button
+                  onClick={dumpYard.finishPolygon}
+                  className="bg-emerald-600 text-white px-4 py-2 text-[10px] font-bold tracking-widest hover:bg-emerald-500 transition"
+                >
+                  ✓ FINISH POLYGON
+                </button>
+              )}
+              <button
+                onClick={dumpYard.resetYard}
+                className="text-[9px] text-muted-foreground hover:text-red-400 uppercase tracking-widest border border-border px-3 py-2 hover:border-red-500/40 transition"
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}

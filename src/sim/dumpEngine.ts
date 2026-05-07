@@ -20,7 +20,8 @@ export function pickDumpCell(
   now: number,
   entryPoint: [number, number] = [2, 2],
   isDemoMode: boolean = false,
-  strategy: "LEGACY" | "MIXED_FLEET" = "LEGACY"
+  strategy: "LEGACY" | "MIXED_FLEET" = "LEGACY",
+  isInsideYard?: (gx: number, gy: number) => boolean
 ): DumpCellResult | null {
   const truckGrid = worldToGrid(truck.position[0], truck.position[2]);
   // 1. Hexagonal/Staggered Grid: Enforcing exactly 3.03m gap between dumps
@@ -74,6 +75,9 @@ export function pickDumpCell(
         const y = Math.round(yF);
         
         if (x < 0 || y < 0 || x >= GRID_SIZE || y >= GRID_SIZE) continue;
+
+        // Skip cells outside the user-drawn dump yard polygon
+        if (isInsideYard && !isInsideYard(x, y)) continue;
 
         const c = grid[y][x];
 
@@ -151,6 +155,8 @@ export function pickDumpCell(
       for (let xF = minX + staggerOffset; xF <= maxX; xF += SLOT_SPACING) {
         const x = Math.round(xF);
         if (x < 0 || x >= GRID_SIZE) continue;
+        // Skip slots outside the user-drawn dump yard polygon
+        if (isInsideYard && !isInsideYard(x, rowY)) continue;
         allSlots.push({
           x,
           y: rowY,
